@@ -633,11 +633,50 @@ static std::optional<IntegerRelation> find_integer_relation(
         return true;
     };
 
+    const long double normalized_tolerance = tolerance / norm;
+    const auto extract_relation = [&]() -> std::optional<IntegerRelation> {
+        for (std::size_t column = 0; column < size; ++column) {
+            if (std::abs(y[column]) > normalized_tolerance) continue;
+            IntegerRelation relation;
+            relation.size = size;
+            std::int64_t divisor = 0;
+            std::int64_t largest = 0;
+            for (std::size_t row = 0; row < size; ++row) {
+                relation.coefficients[row] = b[row][column];
+                const std::int64_t magnitude = static_cast<std::int64_t>(std::abs(b[row][column]));
+                largest = std::max(largest, magnitude);
+                divisor = std::gcd(divisor, magnitude);
+            }
+            if (largest == 0) continue;
+            if (divisor > 1) {
+                for (std::size_t row = 0; row < size; ++row) relation.coefficients[row] /= divisor;
+                largest /= divisor;
+            }
+            if (largest > maximum_coefficient) continue;
+            for (std::size_t row = 0; row < size; ++row) {
+                if (relation.coefficients[row] == 0) continue;
+                if (relation.coefficients[row] < 0) {
+                    for (std::size_t k = 0; k < size; ++k) relation.coefficients[k] *= -1;
+                }
+                break;
+            }
+            relation.residual = 0.0L;
+            for (std::size_t row = 0; row < size; ++row) {
+                relation.residual += static_cast<long double>(relation.coefficients[row]) * input[row];
+            }
+            if (std::abs(relation.residual) <= tolerance) return relation;
+        }
+        return std::nullopt;
+    };
+
     for (std::size_t i = 1; i < size; ++i) {
         if (!reduce(i, i - 1)) return std::nullopt;
     }
+    // Exact and near-exact relations can emerge during initial reduction.
+    // Check before the first row swap, which may expose a tiny pivot on
+    // extended-precision platforms and make the next reduction ill-conditioned.
+    if (auto relation = extract_relation()) return relation;
 
-    const long double normalized_tolerance = tolerance / norm;
     const long double gamma = std::sqrt(4.0L / 3.0L);
     for (unsigned step = 0; step < maximum_steps; ++step) {
         std::size_t pivot = 0;
@@ -675,37 +714,7 @@ static std::optional<IntegerRelation> find_integer_relation(
             if (!reduce(i, std::min(i - 1, pivot + 1))) return std::nullopt;
         }
 
-        for (std::size_t column = 0; column < size; ++column) {
-            if (std::abs(y[column]) > normalized_tolerance) continue;
-            IntegerRelation relation;
-            relation.size = size;
-            std::int64_t divisor = 0;
-            std::int64_t largest = 0;
-            for (std::size_t row = 0; row < size; ++row) {
-                relation.coefficients[row] = b[row][column];
-                const std::int64_t magnitude = static_cast<std::int64_t>(std::abs(b[row][column]));
-                largest = std::max(largest, magnitude);
-                divisor = std::gcd(divisor, magnitude);
-            }
-            if (largest == 0) continue;
-            if (divisor > 1) {
-                for (std::size_t row = 0; row < size; ++row) relation.coefficients[row] /= divisor;
-                largest /= divisor;
-            }
-            if (largest > maximum_coefficient) continue;
-            for (std::size_t row = 0; row < size; ++row) {
-                if (relation.coefficients[row] == 0) continue;
-                if (relation.coefficients[row] < 0) {
-                    for (std::size_t k = 0; k < size; ++k) relation.coefficients[k] *= -1;
-                }
-                break;
-            }
-            relation.residual = 0.0L;
-            for (std::size_t row = 0; row < size; ++row) {
-                relation.residual += static_cast<long double>(relation.coefficients[row]) * input[row];
-            }
-            if (std::abs(relation.residual) <= tolerance) return relation;
-        }
+        if (auto relation = extract_relation()) return relation;
     }
     return std::nullopt;
 }
