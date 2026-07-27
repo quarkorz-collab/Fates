@@ -17,6 +17,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <numbers>
 #include <optional>
 #include <set>
@@ -472,15 +473,32 @@ struct Config {
     double genetic_crossover = 0.25;
     double genetic_novelty = 0.20;
     unsigned genetic_tournament = 4;
+    std::size_t pslq_basis = 192;
+    std::uint64_t pslq_pairs = 4'096;
+    std::int64_t pslq_max_coefficient = 64;
+    unsigned pslq_steps = 64;
+    double pslq_tolerance = 1.0e-12;
+    std::size_t egraph_seeds = 768;
+    unsigned egraph_rounds = 2;
+    std::size_t egraph_node_limit = 4'096;
+    std::size_t mcts_iterations = 8'192;
+    unsigned mcts_depth = 4;
+    unsigned mcts_branching = 12;
+    double mcts_exploration = 1.25;
+    double mcts_elegance = 0.25;
+    std::uint64_t mcts_seed = 0x13198a2e03707344ULL;
     std::size_t live_top = 0;
     double live_interval = 2.0;
     std::size_t max_atoms = 200'000;
-    std::string mode = "pareto";
+    std::string mode = "nearest";
 
     bool json = false;
     bool bidirectional = true;
     bool equations = false;
     bool genetic = false;
+    bool pslq = false;
+    bool egraph = false;
+    bool mcts = false;
     bool portfolio = false;
     bool live = false;
     bool live_json = false;
@@ -542,6 +560,154 @@ static double abs_error(double value, double target) {
 static double rel_error(double value, double target) {
     if (target == 0.0) return std::abs(value);
     return std::abs(value - target) / std::abs(target);
+}
+
+struct IntegerRelation {
+    std::array<std::int64_t, 4> coefficients{};
+    std::size_t size{};
+    long double residual{};
+};
+
+// Bounded PSLQ for the small relation vectors used by the search stage. The
+// matrices stay on the stack and coefficients are capped before conversion.
+static std::optional<IntegerRelation> find_integer_relation(
+    const std::array<long double, 4>& input,
+    std::size_t size,
+    long double tolerance,
+    std::int64_t maximum_coefficient,
+    unsigned maximum_steps) {
+    constexpr std::size_t capacity = 4;
+    if (size < 2 || size > capacity || tolerance <= 0.0L || maximum_coefficient <= 0) {
+        return std::nullopt;
+    }
+
+    long double norm2 = 0.0L;
+    for (std::size_t i = 0; i < size; ++i) {
+        if (!std::isfinite(input[i]) || input[i] == 0.0L) return std::nullopt;
+        norm2 += input[i] * input[i];
+    }
+    const long double norm = std::sqrt(norm2);
+    if (!std::isfinite(norm) || norm == 0.0L) return std::nullopt;
+
+    std::array<long double, capacity> y{};
+    std::array<long double, capacity> s{};
+    std::array<std::array<long double, capacity>, capacity> h{};
+    std::array<std::array<std::int64_t, capacity>, capacity> b{};
+    for (std::size_t i = 0; i < size; ++i) b[i][i] = 1;
+
+    for (std::size_t k = 0; k < size; ++k) {
+        long double tail = 0.0L;
+        for (std::size_t j = k; j < size; ++j) tail += input[j] * input[j];
+        s[k] = std::sqrt(tail) / norm;
+        y[k] = input[k] / norm;
+    }
+    for (std::size_t i = 0; i < size; ++i) {
+        if (i + 1 < size && s[i] != 0.0L) h[i][i] = s[i + 1] / s[i];
+        for (std::size_t j = 0; j < i; ++j) {
+            const long double denominator = s[j] * s[j + 1];
+            if (denominator != 0.0L) h[i][j] = -y[i] * y[j] / denominator;
+        }
+    }
+
+    const long double coefficient_guard = std::max<long double>(
+        1.0e6L, static_cast<long double>(maximum_coefficient) * 4096.0L);
+    const auto reduce = [&](std::size_t row, std::size_t first_column) -> bool {
+        for (std::size_t offset = 0; offset <= first_column; ++offset) {
+            const std::size_t column = first_column - offset;
+            if (h[column][column] == 0.0L) continue;
+            const long double quotient = h[row][column] / h[column][column];
+            if (!std::isfinite(quotient) || std::abs(quotient) > coefficient_guard) return false;
+            const std::int64_t multiplier = static_cast<std::int64_t>(std::llround(quotient));
+            if (multiplier == 0) continue;
+            y[column] += static_cast<long double>(multiplier) * y[row];
+            for (std::size_t k = 0; k <= column; ++k) {
+                h[row][k] -= static_cast<long double>(multiplier) * h[column][k];
+            }
+            for (std::size_t k = 0; k < size; ++k) {
+                const long double updated = static_cast<long double>(b[k][column]) +
+                    static_cast<long double>(multiplier) * b[k][row];
+                if (!std::isfinite(updated) || std::abs(updated) > coefficient_guard) return false;
+                b[k][column] = static_cast<std::int64_t>(std::llround(updated));
+            }
+        }
+        return true;
+    };
+
+    for (std::size_t i = 1; i < size; ++i) {
+        if (!reduce(i, i - 1)) return std::nullopt;
+    }
+
+    const long double normalized_tolerance = tolerance / norm;
+    const long double gamma = std::sqrt(4.0L / 3.0L);
+    for (unsigned step = 0; step < maximum_steps; ++step) {
+        std::size_t pivot = 0;
+        long double maximum = -1.0L;
+        long double weight = gamma;
+        for (std::size_t i = 0; i + 1 < size; ++i) {
+            const long double score = weight * std::abs(h[i][i]);
+            if (score > maximum) {
+                maximum = score;
+                pivot = i;
+            }
+            weight *= gamma;
+        }
+
+        std::swap(y[pivot], y[pivot + 1]);
+        std::swap(h[pivot], h[pivot + 1]);
+        for (std::size_t i = 0; i < size; ++i) {
+            std::swap(b[i][pivot], b[i][pivot + 1]);
+        }
+
+        if (pivot + 2 < size) {
+            const long double diagonal = std::hypot(h[pivot][pivot], h[pivot][pivot + 1]);
+            if (diagonal == 0.0L || !std::isfinite(diagonal)) break;
+            const long double cosine = h[pivot][pivot] / diagonal;
+            const long double sine = h[pivot][pivot + 1] / diagonal;
+            for (std::size_t i = pivot; i < size; ++i) {
+                const long double first = h[i][pivot];
+                const long double second = h[i][pivot + 1];
+                h[i][pivot] = cosine * first + sine * second;
+                h[i][pivot + 1] = -sine * first + cosine * second;
+            }
+        }
+
+        for (std::size_t i = pivot + 1; i < size; ++i) {
+            if (!reduce(i, std::min(i - 1, pivot + 1))) return std::nullopt;
+        }
+
+        for (std::size_t column = 0; column < size; ++column) {
+            if (std::abs(y[column]) > normalized_tolerance) continue;
+            IntegerRelation relation;
+            relation.size = size;
+            std::int64_t divisor = 0;
+            std::int64_t largest = 0;
+            for (std::size_t row = 0; row < size; ++row) {
+                relation.coefficients[row] = b[row][column];
+                const std::int64_t magnitude = static_cast<std::int64_t>(std::abs(b[row][column]));
+                largest = std::max(largest, magnitude);
+                divisor = std::gcd(divisor, magnitude);
+            }
+            if (largest == 0) continue;
+            if (divisor > 1) {
+                for (std::size_t row = 0; row < size; ++row) relation.coefficients[row] /= divisor;
+                largest /= divisor;
+            }
+            if (largest > maximum_coefficient) continue;
+            for (std::size_t row = 0; row < size; ++row) {
+                if (relation.coefficients[row] == 0) continue;
+                if (relation.coefficients[row] < 0) {
+                    for (std::size_t k = 0; k < size; ++k) relation.coefficients[k] *= -1;
+                }
+                break;
+            }
+            relation.residual = 0.0L;
+            for (std::size_t row = 0; row < size; ++row) {
+                relation.residual += static_cast<long double>(relation.coefficients[row]) * input[row];
+            }
+            if (std::abs(relation.residual) <= tolerance) return relation;
+        }
+    }
+    return std::nullopt;
 }
 
 static std::uint64_t candidate_shape_signature(const Candidate& candidate) {
@@ -2418,17 +2584,29 @@ struct SearchStats {
     bool used_deep_compositions{};
     bool used_exploration{};
     bool used_genetic{};
+    bool used_pslq{};
+    bool used_egraph{};
+    bool used_mcts{};
     bool used_portfolio{};
     unsigned genetic_generations{};
     std::size_t genetic_repairs{};
     std::size_t genetic_repairs_kept{};
     std::size_t genetic_crossovers{};
     std::size_t genetic_crossovers_kept{};
+    std::size_t pslq_relations{};
+    std::size_t pslq_candidates{};
+    std::size_t egraph_rewrites{};
+    std::size_t egraph_candidates{};
+    std::size_t mcts_expansions{};
+    std::size_t mcts_candidates{};
     std::size_t inverse_candidates{};
     double deterministic_seconds{};
     double mitm_seconds{};
     double inverse_seconds{};
     double deep_seconds{};
+    double egraph_seconds{};
+    double pslq_seconds{};
+    double mcts_seconds{};
     double genetic_seconds{};
 };
 
@@ -2668,6 +2846,8 @@ public:
                       << "  \"configuration_valid\": true,\n"
                       << "  \"container_backend\": \"" << kContainerBackend << "\",\n"
                       << "  \"target\": " << std::setprecision(17) << cfg_.target << ",\n"
+                      << "  \"result_mode\": \"" << cfg_.mode << "\",\n"
+                      << "  \"search_mode\": \"" << configured_search_mode() << "\",\n"
                       << "  \"atoms\": " << atoms_.size() << ",\n"
                       << "  \"unary_operators\": " << unary_ops_.size() << ",\n"
                       << "  \"binary_operators\": " << binary_ops_.size() << ",\n"
@@ -2690,9 +2870,26 @@ public:
                       << "  \"equation_quality\": \"" << equation_quality_mode_name(cfg_.equation_quality) << "\",\n"
                       << "  \"portfolio\": " << (cfg_.portfolio ? "true" : "false") << ",\n"
                       << "  \"genetic\": " << (cfg_.genetic ? "true" : "false") << ",\n"
+                      << "  \"pslq\": " << (cfg_.pslq ? "true" : "false") << ",\n"
+                      << "  \"egraph\": " << (cfg_.egraph ? "true" : "false") << ",\n"
+                      << "  \"mcts\": " << (cfg_.mcts ? "true" : "false") << ",\n"
                       << "  \"genetic_crossover\": " << cfg_.genetic_crossover << ",\n"
                       << "  \"genetic_novelty\": " << cfg_.genetic_novelty << ",\n"
-                      << "  \"genetic_tournament\": " << cfg_.genetic_tournament << "\n"
+                      << "  \"genetic_tournament\": " << cfg_.genetic_tournament << ",\n"
+                      << "  \"pslq_basis\": " << cfg_.pslq_basis << ",\n"
+                      << "  \"pslq_pairs\": " << cfg_.pslq_pairs << ",\n"
+                      << "  \"pslq_coefficient\": " << cfg_.pslq_max_coefficient << ",\n"
+                      << "  \"pslq_steps\": " << cfg_.pslq_steps << ",\n"
+                      << "  \"pslq_tolerance\": " << cfg_.pslq_tolerance << ",\n"
+                      << "  \"egraph_seeds\": " << cfg_.egraph_seeds << ",\n"
+                      << "  \"egraph_rounds\": " << cfg_.egraph_rounds << ",\n"
+                      << "  \"egraph_nodes\": " << cfg_.egraph_node_limit << ",\n"
+                      << "  \"mcts_iterations\": " << cfg_.mcts_iterations << ",\n"
+                      << "  \"mcts_depth\": " << cfg_.mcts_depth << ",\n"
+                      << "  \"mcts_branching\": " << cfg_.mcts_branching << ",\n"
+                      << "  \"mcts_exploration\": " << cfg_.mcts_exploration << ",\n"
+                      << "  \"mcts_elegance\": " << cfg_.mcts_elegance << ",\n"
+                      << "  \"mcts_seed\": " << cfg_.mcts_seed << "\n"
                       << "}\n";
             return;
         }
@@ -2701,10 +2898,7 @@ public:
         std::cout << "Configuration valid\n\n"
                   << "  Target            : " << std::setprecision(17) << cfg_.target << '\n'
                   << "  Container backend : " << kContainerBackend << '\n'
-                  << "  Search mode       : " << (cfg_.equations ? "equations" :
-                                                   (cfg_.portfolio && cfg_.genetic ? "portfolio + genetic" :
-                                                    (cfg_.portfolio ? "portfolio" :
-                                                     (cfg_.genetic ? "hybrid genetic" : "deterministic")))) << '\n'
+                  << "  Search mode       : " << configured_search_mode() << '\n'
                   << "  Cost              : " << cfg_.max_cost << " (generated " << generated_cost << ")\n"
                   << "  Beam / pairs      : " << cfg_.beam << " / " << cfg_.pair_budget << '\n'
                    << "  Threads / bits    : " << cfg_.threads << " / " << cfg_.value_bits << '\n'
@@ -2724,7 +2918,11 @@ public:
                   << cfg_.symbol_constraints.required_order.size() << '\n'
                   << "  Extensions        : " << extension_registry().unary_operations().size() << " unary / "
                   << extension_registry().binary_operations().size() << " binary / "
-                  << cfg_.extension_constraints.constraints.size() << " constraints\n";
+                  << cfg_.extension_constraints.constraints.size() << " constraints\n"
+                  << "  Advanced phases   : PSLQ " << (cfg_.pslq ? "on" : "off")
+                  << " / e-graph " << (cfg_.egraph ? "on" : "off")
+                  << " / MCTS " << (cfg_.mcts ? "on" : "off")
+                  << " / genetic " << (cfg_.genetic ? "on" : "off") << '\n';
     }
 
     SearchRun run() {
@@ -2946,6 +3144,24 @@ public:
             }
             stats_.completed_cost = cfg_.max_cost;
         }
+        if (cfg_.egraph && !cfg_.equations && !stopped_on_epsilon) {
+            const auto stage_start = std::chrono::steady_clock::now();
+            run_egraph_search(live_reporter);
+            stats_.egraph_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - stage_start).count();
+        }
+        if (cfg_.pslq && !cfg_.equations && !stopped_on_epsilon) {
+            const auto stage_start = std::chrono::steady_clock::now();
+            run_pslq_search(live_reporter);
+            stats_.pslq_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - stage_start).count();
+        }
+        if (cfg_.mcts && !cfg_.equations && !stopped_on_epsilon) {
+            const auto stage_start = std::chrono::steady_clock::now();
+            run_mcts_search(live_reporter);
+            stats_.mcts_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - stage_start).count();
+        }
         if (cfg_.genetic && !cfg_.equations && !stopped_on_epsilon) {
             const auto stage_start = std::chrono::steady_clock::now();
             run_genetic_search(live_reporter);
@@ -2959,6 +3175,16 @@ public:
     }
 
 private:
+    std::string configured_search_mode() const {
+        if (cfg_.equations) return "equations";
+        std::string mode = cfg_.portfolio ? "portfolio" : "deterministic";
+        if (cfg_.pslq && !cfg_.portfolio) mode += "+pslq";
+        if (cfg_.egraph && !cfg_.portfolio) mode += "+egraph";
+        if (cfg_.mcts && !cfg_.portfolio) mode += "+mcts";
+        if (cfg_.genetic) mode += "+genetic";
+        return mode;
+    }
+
     std::size_t pareto_extra_cap() const {
         if (cfg_.pareto_slots <= 1) return 0;
         if (cfg_.pareto_extra != 0) return cfg_.pareto_extra;
@@ -3271,6 +3497,99 @@ private:
             out.erase(std::unique(out.begin(), out.end()), out.end());
         }
         return snapshot;
+    }
+
+    const UnarySpec* find_unary_operation(UnaryKind kind) const {
+        const auto found = std::find_if(unary_ops_.begin(), unary_ops_.end(),
+                                        [&](const UnarySpec& spec) { return spec.kind == kind; });
+        return found == unary_ops_.end() ? nullptr : &*found;
+    }
+
+    const BinarySpec* find_binary_operation(BinaryKind kind) const {
+        const auto found = std::find_if(binary_ops_.begin(), binary_ops_.end(),
+                                        [&](const BinarySpec& spec) { return spec.kind == kind; });
+        return found == binary_ops_.end() ? nullptr : &*found;
+    }
+
+    FastMap<std::uint64_t, ExprId> build_structure_index() const {
+        FastMap<std::uint64_t, ExprId> index;
+        index.reserve(arena_.size() * 2 + 1);
+        for (ExprId id = 0; id < arena_.size(); ++id) {
+            const Node& candidate = arena_[id];
+            const auto found = index.find(candidate.hash);
+            if (found == index.end()) {
+                index.emplace(candidate.hash, id);
+                continue;
+            }
+            const Node& current = arena_[found->second];
+            if ((!current.eligible && candidate.eligible) ||
+                (current.eligible == candidate.eligible &&
+                 std::pair{candidate.cost, candidate.nodes} < std::pair{current.cost, current.nodes})) {
+                found->second = id;
+            }
+        }
+        return index;
+    }
+
+    ExprId materialize_candidate(const Candidate& candidate,
+                                 FastMap<std::uint64_t, ExprId>& structure_index,
+                                 std::vector<unsigned char>& touched_cost,
+                                 bool eligible,
+                                 bool prune_by_value,
+                                 bool* newly_eligible = nullptr) {
+        if (newly_eligible) *newly_eligible = false;
+        if (candidate.cost == 0 || candidate.cost > cfg_.max_cost) return kNoExpr;
+
+        if (const auto found = structure_index.find(candidate.hash); found != structure_index.end()) {
+            const ExprId id = found->second;
+            Node& node = arena_[id];
+            if (eligible && !node.eligible) {
+                node.eligible = true;
+                layers_[node.cost].push_back(id);
+                touched_cost[node.cost] = 1;
+                seen_.emplace(state_bucket(node.value, node.derivative, node.depends_on_x,
+                                           node.constraint_state, state_value_bits(cfg_), false));
+                ++stats_.kept;
+                if (newly_eligible) *newly_eligible = true;
+            }
+            return id;
+        }
+
+        const std::uint64_t value_key = state_bucket(
+            candidate.value, candidate.derivative, candidate.depends_on_x,
+            candidate.constraint_state, state_value_bits(cfg_), false);
+        if (eligible && prune_by_value && seen_.find(value_key) != seen_.end()) return kNoExpr;
+
+        const ExprId id = append_candidate_node(candidate, eligible);
+        structure_index.emplace(candidate.hash, id);
+        if (eligible) {
+            layers_[candidate.cost].push_back(id);
+            touched_cost[candidate.cost] = 1;
+            seen_.emplace(value_key);
+            ++stats_.kept;
+            if (newly_eligible) *newly_eligible = true;
+        }
+        return id;
+    }
+
+    void sort_touched_layers(const std::vector<unsigned char>& touched_cost) {
+        for (unsigned cost = 1; cost < layers_.size(); ++cost) {
+            if (!touched_cost[cost]) continue;
+            auto& ids = layers_[cost];
+            std::sort(ids.begin(), ids.end(), [&](ExprId a, ExprId b) {
+                if (arena_[a].value != arena_[b].value) return arena_[a].value < arena_[b].value;
+                if (arena_[a].nodes != arena_[b].nodes) return arena_[a].nodes < arena_[b].nodes;
+                if (arena_[a].hash != arena_[b].hash) return arena_[a].hash < arena_[b].hash;
+                return a < b;
+            });
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+            stats_.by_cost[cost].kept = ids.size();
+        }
+    }
+
+    static bool equivalent_value(double left, double right) {
+        const double scale = std::max({1.0, std::abs(left), std::abs(right)});
+        return std::abs(left - right) <= 128.0 * std::numeric_limits<double>::epsilon() * scale;
     }
 
     double nearest_value_score(const std::vector<ExprId>& ids, double desired) const {
@@ -3827,9 +4146,12 @@ private:
 
                     const auto process_direction = [&](bool reverse) {
                         const auto& outer_ids = reverse ? layers_[right_cost] : layers_[left_cost];
+                        // Local collectors prune before the partition results are merged. Keep
+                        // the partition boundaries independent of worker count so identical
+                        // settings produce the same archive with any --threads value. Sixteen
+                        // chunks preserves the established default eight-worker search shape.
                         const std::size_t desired_chunks = std::max<std::size_t>(
-                            1, std::min<std::size_t>(cfg_.task_chunks,
-                                                     static_cast<std::size_t>(cfg_.threads) * 2));
+                            1, std::min<std::size_t>(cfg_.task_chunks, 16));
                         const std::size_t chunks = std::min(outer_ids.size(), desired_chunks);
                         const std::size_t chunk_size = (outer_ids.size() + chunks - 1) / chunks;
                         std::vector<GenTask> tasks;
@@ -4232,6 +4554,837 @@ private:
                 }
             }
             frontier = std::move(next_frontier);
+        }
+    }
+
+    std::vector<ExprId> select_pslq_basis() const {
+        struct RankedBasis {
+            ExprId id{kNoExpr};
+            double score{};
+            std::uint64_t value_key{};
+        };
+
+        std::vector<RankedBasis> ranked;
+        ranked.reserve(arena_.size());
+        for (ExprId id = 0; id < arena_.size(); ++id) {
+            const Node& node = arena_[id];
+            if (!node.eligible || node.depends_on_x || node.value == 0.0 ||
+                !std::isfinite(node.value) || node.cost > cfg_.max_cost) {
+                continue;
+            }
+            const double magnitude = std::abs(node.value);
+            const double scale_penalty = std::abs(std::log(std::max(magnitude, 1.0e-300)));
+            const double target_ratio = std::abs(std::log(
+                std::max(magnitude, 1.0e-300) /
+                std::max(std::abs(cfg_.target), 1.0e-300)));
+            const double score = static_cast<double>(node.cost) + 0.06 * node.nodes +
+                                 0.015 * scale_penalty + 0.01 * target_ratio;
+            ranked.push_back({id, score, value_bucket(node.value, 48)});
+        }
+        std::sort(ranked.begin(), ranked.end(), [&](const RankedBasis& left, const RankedBasis& right) {
+            if (left.score != right.score) return left.score < right.score;
+            const Node& a = arena_[left.id];
+            const Node& b = arena_[right.id];
+            if (a.cost != b.cost) return a.cost < b.cost;
+            if (a.nodes != b.nodes) return a.nodes < b.nodes;
+            return a.hash < b.hash;
+        });
+
+        std::vector<ExprId> basis;
+        basis.reserve(std::min(cfg_.pslq_basis, ranked.size()));
+        FastSet<std::uint64_t> values;
+        values.reserve(cfg_.pslq_basis * 2 + 1);
+        for (const RankedBasis& entry : ranked) {
+            if (!values.emplace(entry.value_key).second) continue;
+            basis.push_back(entry.id);
+            if (basis.size() == cfg_.pslq_basis) break;
+        }
+        return basis;
+    }
+
+    std::vector<ExprId> pslq_integer_library(std::int64_t maximum) const {
+        std::vector<ExprId> integers(static_cast<std::size_t>(maximum) + 1, kNoExpr);
+        for (ExprId id = 0; id < arena_.size(); ++id) {
+            const Node& node = arena_[id];
+            if (!node.eligible || node.depends_on_x || node.value < 1.0 ||
+                node.value > static_cast<double>(maximum)) {
+                continue;
+            }
+            const double rounded = std::nearbyint(node.value);
+            if (std::abs(node.value - rounded) >
+                8.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, node.value)) {
+                continue;
+            }
+            const std::size_t value = static_cast<std::size_t>(rounded);
+            ExprId& current = integers[value];
+            if (current == kNoExpr ||
+                std::pair{node.cost, node.nodes} <
+                    std::pair{arena_[current].cost, arena_[current].nodes}) {
+                current = id;
+            }
+        }
+        return integers;
+    }
+
+    void run_pslq_search(LiveTopReporter& live_reporter) {
+        stats_.used_pslq = true;
+        const std::vector<ExprId> basis = select_pslq_basis();
+        if (basis.empty()) return;
+
+        const auto integer_ids = pslq_integer_library(cfg_.pslq_max_coefficient);
+        const BinarySpec* add = find_binary_operation(BinaryKind::Add);
+        const BinarySpec* sub = find_binary_operation(BinaryKind::Sub);
+        const BinarySpec* mul = find_binary_operation(BinaryKind::Mul);
+        const BinarySpec* div = find_binary_operation(BinaryKind::Div);
+        const UnarySpec* neg = find_unary_operation(UnaryKind::Neg);
+        FastMap<std::uint64_t, ExprId> structure_index = build_structure_index();
+        std::vector<unsigned char> touched_cost(cfg_.max_cost + 1, 0);
+        std::vector<Candidate> live_candidates;
+        live_candidates.reserve(std::min<std::size_t>(basis.size() * 2, 512));
+
+        double existing_best = std::numeric_limits<double>::infinity();
+        for (const Node& node : arena_) {
+            if (!node.eligible || !constraint_satisfied(cfg_, node.constraint_state) ||
+                !cfg_.error_range.contains(node.value - cfg_.target)) {
+                continue;
+            }
+            existing_best = std::min(existing_best, std::abs(node.value - cfg_.target));
+        }
+        if (!std::isfinite(existing_best)) existing_best = std::max(1.0, std::abs(cfg_.target));
+
+        const auto evaluate_unary = [&](const UnarySpec& operation, ExprId child) -> ExprId {
+            const unsigned cost = static_cast<unsigned>(arena_[child].cost) + operation.cost;
+            if (cost > cfg_.max_cost) return kNoExpr;
+            ++stats_.attempted;
+            ++stats_.by_cost[cost].attempted;
+            const auto candidate = apply_unary(
+                cfg_, arena_, operation, child, static_cast<std::uint16_t>(cost));
+            if (!candidate) return kNoExpr;
+            ++stats_.valid;
+            ++stats_.by_cost[cost].valid;
+            return materialize_candidate(*candidate, structure_index, touched_cost, false, false);
+        };
+        const auto evaluate_binary = [&](const BinarySpec& operation, ExprId left, ExprId right) -> ExprId {
+            const unsigned cost = static_cast<unsigned>(arena_[left].cost) + arena_[right].cost + operation.cost;
+            if (cost > cfg_.max_cost) return kNoExpr;
+            ++stats_.attempted;
+            ++stats_.by_cost[cost].attempted;
+            const auto candidate = apply_binary(
+                cfg_, arena_, operation, left, right, static_cast<std::uint16_t>(cost));
+            if (!candidate) return kNoExpr;
+            ++stats_.valid;
+            ++stats_.by_cost[cost].valid;
+            return materialize_candidate(*candidate, structure_index, touched_cost, false, false);
+        };
+
+        const auto build_relation = [&](IntegerRelation relation,
+                                        const std::array<ExprId, 3>& relation_basis) {
+            if (relation.size < 2 || relation.coefficients[0] == 0) return;
+            if (relation.coefficients[0] < 0) {
+                for (std::size_t index = 0; index < relation.size; ++index) {
+                    relation.coefficients[index] *= -1;
+                }
+            }
+
+            std::array<ExprId, 3> positive{kNoExpr, kNoExpr, kNoExpr};
+            std::array<ExprId, 3> negative{kNoExpr, kNoExpr, kNoExpr};
+            std::size_t positive_count = 0;
+            std::size_t negative_count = 0;
+            for (std::size_t index = 1; index < relation.size; ++index) {
+                const std::int64_t coefficient = -relation.coefficients[index];
+                if (coefficient == 0) continue;
+                const std::int64_t magnitude = static_cast<std::int64_t>(std::abs(coefficient));
+                ExprId term = relation_basis[index - 1];
+                if (magnitude > 1) {
+                    if (!mul || magnitude >= static_cast<std::int64_t>(integer_ids.size()) ||
+                        integer_ids[static_cast<std::size_t>(magnitude)] == kNoExpr) {
+                        return;
+                    }
+                    term = evaluate_binary(*mul, integer_ids[static_cast<std::size_t>(magnitude)], term);
+                    if (term == kNoExpr) return;
+                }
+                if (coefficient > 0) positive[positive_count++] = term;
+                else negative[negative_count++] = term;
+            }
+            if (positive_count == 0 && negative_count == 0) return;
+
+            const auto combine_terms = [&](const std::array<ExprId, 3>& terms,
+                                           std::size_t count) -> ExprId {
+                if (count == 0) return kNoExpr;
+                ExprId current = terms[0];
+                for (std::size_t index = 1; index < count; ++index) {
+                    if (!add) return kNoExpr;
+                    current = evaluate_binary(*add, current, terms[index]);
+                    if (current == kNoExpr) return kNoExpr;
+                }
+                return current;
+            };
+
+            const ExprId positive_sum = combine_terms(positive, positive_count);
+            const ExprId negative_sum = combine_terms(negative, negative_count);
+            if ((positive_count != 0 && positive_sum == kNoExpr) ||
+                (negative_count != 0 && negative_sum == kNoExpr)) {
+                return;
+            }
+            ExprId result = kNoExpr;
+            if (positive_sum != kNoExpr && negative_sum != kNoExpr) {
+                if (!sub) return;
+                result = evaluate_binary(*sub, positive_sum, negative_sum);
+            } else if (positive_sum != kNoExpr) {
+                result = positive_sum;
+            } else {
+                if (!neg) return;
+                result = evaluate_unary(*neg, negative_sum);
+            }
+            if (result == kNoExpr) return;
+
+            const std::int64_t target_coefficient = relation.coefficients[0];
+            if (target_coefficient > 1) {
+                if (!div || target_coefficient >= static_cast<std::int64_t>(integer_ids.size()) ||
+                    integer_ids[static_cast<std::size_t>(target_coefficient)] == kNoExpr) {
+                    return;
+                }
+                result = evaluate_binary(
+                    *div, result, integer_ids[static_cast<std::size_t>(target_coefficient)]);
+                if (result == kNoExpr) return;
+            }
+
+            bool newly_eligible = false;
+            const Candidate final_candidate = candidate_from_node(result);
+            const ExprId final_id = materialize_candidate(
+                final_candidate, structure_index, touched_cost, true, true, &newly_eligible);
+            if (final_id == kNoExpr || !newly_eligible) return;
+            ++stats_.pslq_candidates;
+            live_candidates.push_back(candidate_from_node(final_id));
+        };
+
+        const auto probe = [&](const std::array<ExprId, 3>& ids, std::size_t relation_size) {
+            std::array<long double, 4> values{};
+            values[0] = static_cast<long double>(cfg_.target);
+            long double scale = std::max(1.0L, std::abs(values[0]));
+            for (std::size_t index = 1; index < relation_size; ++index) {
+                values[index] = static_cast<long double>(arena_[ids[index - 1]].value);
+                scale += std::abs(values[index]);
+            }
+            const long double configured = static_cast<long double>(cfg_.pslq_tolerance) * scale;
+            const long double adaptive = static_cast<long double>(existing_best) *
+                                         std::max<std::int64_t>(1, cfg_.pslq_max_coefficient);
+            const long double tolerance = std::max(configured, std::min(scale * 1.0e-3L, adaptive));
+            const auto relation = find_integer_relation(
+                values, relation_size, tolerance, cfg_.pslq_max_coefficient, cfg_.pslq_steps);
+            if (!relation || relation->coefficients[0] == 0) return;
+            ++stats_.pslq_relations;
+            build_relation(*relation, ids);
+        };
+
+        for (ExprId id : basis) probe({id, kNoExpr, kNoExpr}, 2);
+        std::uint64_t pair_count = 0;
+        for (std::size_t left = 0; left < basis.size() && pair_count < cfg_.pslq_pairs; ++left) {
+            for (std::size_t right = left + 1;
+                 right < basis.size() && pair_count < cfg_.pslq_pairs; ++right, ++pair_count) {
+                probe({basis[left], basis[right], kNoExpr}, 3);
+            }
+        }
+
+        sort_touched_layers(touched_cost);
+        if (cfg_.live && !live_candidates.empty()) {
+            live_reporter.consider_batch(live_candidates, cfg_.max_cost);
+            live_reporter.snapshot(cfg_.max_cost);
+        }
+        if (cfg_.verbose) {
+            std::cerr << "pslq_basis=" << basis.size()
+                      << " relations=" << stats_.pslq_relations
+                      << " appended=" << stats_.pslq_candidates << '\n';
+        }
+    }
+
+    void run_egraph_search(LiveTopReporter& live_reporter) {
+        stats_.used_egraph = true;
+        if (cfg_.egraph_node_limit == 0 || cfg_.egraph_rounds == 0) return;
+
+        struct SaturationGraph {
+            std::vector<std::size_t> parent;
+            std::vector<ExprId> best;
+            FastMap<ExprId, std::size_t> membership;
+
+            std::size_t add(ExprId id) {
+                if (const auto found = membership.find(id); found != membership.end()) {
+                    return found->second;
+                }
+                const std::size_t index = parent.size();
+                parent.push_back(index);
+                best.push_back(id);
+                membership.emplace(id, index);
+                return index;
+            }
+
+            std::size_t root(std::size_t index) {
+                while (parent[index] != index) {
+                    parent[index] = parent[parent[index]];
+                    index = parent[index];
+                }
+                return index;
+            }
+
+            void unite(ExprId left, ExprId right, const std::vector<Node>& arena) {
+                std::size_t a = root(add(left));
+                std::size_t b = root(add(right));
+                if (a == b) return;
+                if (b < a) std::swap(a, b);
+                parent[b] = a;
+                const ExprId left_best = best[a];
+                const ExprId right_best = best[b];
+                const Node& x = arena[left_best];
+                const Node& y = arena[right_best];
+                if (std::pair{y.cost, y.nodes} < std::pair{x.cost, x.nodes}) best[a] = right_best;
+            }
+        } graph;
+
+        std::vector<ExprId> candidates;
+        candidates.reserve(arena_.size());
+        for (ExprId id = 0; id < arena_.size(); ++id) {
+            const Node& node = arena_[id];
+            if (node.eligible && !node.depends_on_x && node.tag != NodeTag::Atom) candidates.push_back(id);
+        }
+        const auto elegance_order = [&](ExprId left, ExprId right) {
+            const Node& a = arena_[left];
+            const Node& b = arena_[right];
+            if (a.cost != b.cost) return a.cost < b.cost;
+            if (a.nodes != b.nodes) return a.nodes < b.nodes;
+            return a.hash < b.hash;
+        };
+        const auto target_order = [&](ExprId left, ExprId right) {
+            const Node& a = arena_[left];
+            const Node& b = arena_[right];
+            const double ae = std::abs(a.value - cfg_.target) / std::max(1.0, std::abs(cfg_.target));
+            const double be = std::abs(b.value - cfg_.target) / std::max(1.0, std::abs(cfg_.target));
+            const double as = std::log1p(ae * 1.0e12) + 0.08 * a.cost + 0.01 * a.nodes;
+            const double bs = std::log1p(be * 1.0e12) + 0.08 * b.cost + 0.01 * b.nodes;
+            if (as != bs) return as < bs;
+            return elegance_order(left, right);
+        };
+
+        std::vector<ExprId> seeds;
+        seeds.reserve(std::min(cfg_.egraph_seeds, candidates.size()));
+        FastSet<ExprId> selected;
+        selected.reserve(cfg_.egraph_seeds * 2 + 1);
+        std::sort(candidates.begin(), candidates.end(), elegance_order);
+        const std::size_t elegance_count = std::min(candidates.size(), (cfg_.egraph_seeds + 1) / 2);
+        for (std::size_t index = 0; index < elegance_count; ++index) {
+            if (selected.emplace(candidates[index]).second) seeds.push_back(candidates[index]);
+        }
+        std::sort(candidates.begin(), candidates.end(), target_order);
+        for (ExprId id : candidates) {
+            if (selected.emplace(id).second) seeds.push_back(id);
+            if (seeds.size() == cfg_.egraph_seeds) break;
+        }
+        for (ExprId id : seeds) graph.add(id);
+
+        FastMap<std::uint64_t, ExprId> structure_index = build_structure_index();
+        std::vector<unsigned char> touched_cost(cfg_.max_cost + 1, 0);
+        std::vector<Candidate> live_candidates;
+        live_candidates.reserve(std::min<std::size_t>(cfg_.egraph_node_limit, 512));
+
+        const auto make_unary = [&](UnaryKind kind, ExprId child) -> std::optional<Candidate> {
+            const UnarySpec* operation = find_unary_operation(kind);
+            if (!operation) return std::nullopt;
+            const unsigned cost = static_cast<unsigned>(arena_[child].cost) + operation->cost;
+            if (cost > cfg_.max_cost) return std::nullopt;
+            ++stats_.attempted;
+            ++stats_.by_cost[cost].attempted;
+            auto candidate = apply_unary(
+                cfg_, arena_, *operation, child, static_cast<std::uint16_t>(cost));
+            if (candidate) {
+                ++stats_.valid;
+                ++stats_.by_cost[cost].valid;
+            }
+            return candidate;
+        };
+        const auto make_binary = [&](BinaryKind kind, ExprId left, ExprId right) -> std::optional<Candidate> {
+            const BinarySpec* operation = find_binary_operation(kind);
+            if (!operation) return std::nullopt;
+            const unsigned cost = static_cast<unsigned>(arena_[left].cost) + arena_[right].cost + operation->cost;
+            if (cost > cfg_.max_cost) return std::nullopt;
+            ++stats_.attempted;
+            ++stats_.by_cost[cost].attempted;
+            auto candidate = apply_binary(
+                cfg_, arena_, *operation, left, right, static_cast<std::uint16_t>(cost));
+            if (candidate) {
+                ++stats_.valid;
+                ++stats_.by_cost[cost].valid;
+            }
+            return candidate;
+        };
+        const auto materialize_auxiliary = [&](const std::optional<Candidate>& candidate) -> ExprId {
+            if (!candidate) return kNoExpr;
+            return materialize_candidate(
+                *candidate, structure_index, touched_cost, false, false);
+        };
+
+        std::size_t appended = 0;
+        const auto emit = [&](ExprId source_id,
+                              const std::optional<Candidate>& candidate,
+                              std::vector<ExprId>& next) {
+            if (!candidate || appended >= cfg_.egraph_node_limit) return;
+            const Node source = arena_[source_id];
+            if (!equivalent_value(source.value, candidate->value)) return;
+            if (candidate->cost > static_cast<unsigned>(source.cost) + 1U ||
+                candidate->nodes > static_cast<unsigned>(source.nodes) + 1U) {
+                return;
+            }
+            bool newly_eligible = false;
+            const ExprId id = materialize_candidate(
+                *candidate, structure_index, touched_cost, true, false, &newly_eligible);
+            if (id == kNoExpr) return;
+            graph.unite(source_id, id, arena_);
+            ++stats_.egraph_rewrites;
+            if (!newly_eligible) return;
+            ++appended;
+            ++stats_.egraph_candidates;
+            next.push_back(id);
+            live_candidates.push_back(candidate_from_node(id));
+        };
+
+        std::vector<ExprId> frontier = seeds;
+        for (unsigned round = 0;
+             round < cfg_.egraph_rounds && !frontier.empty() && appended < cfg_.egraph_node_limit;
+             ++round) {
+            std::vector<ExprId> next;
+            next.reserve(std::min<std::size_t>(frontier.size() * 2,
+                                               cfg_.egraph_node_limit - appended));
+            for (ExprId source_id : frontier) {
+                if (appended >= cfg_.egraph_node_limit) break;
+                const Node source = arena_[source_id];
+                if (source.tag == NodeTag::Unary) continue;
+                const BinaryKind kind = static_cast<BinaryKind>(source.op);
+                const Node left = arena_[source.left];
+                const Node right = arena_[source.right];
+
+                if (kind == BinaryKind::Add) {
+                    if (unary_node_is(right, UnaryKind::Neg)) {
+                        emit(source_id, make_binary(BinaryKind::Sub, source.left, right.left), next);
+                    }
+                    if (unary_node_is(left, UnaryKind::Neg)) {
+                        emit(source_id, make_binary(BinaryKind::Sub, source.right, left.left), next);
+                    }
+                    if (unary_node_is(left, UnaryKind::Ln) && unary_node_is(right, UnaryKind::Ln) &&
+                        arena_[left.left].value > 0.0 && arena_[right.left].value > 0.0) {
+                        const ExprId product = materialize_auxiliary(
+                            make_binary(BinaryKind::Mul, left.left, right.left));
+                        if (product != kNoExpr) emit(source_id, make_unary(UnaryKind::Ln, product), next);
+                    }
+                    if (unary_node_is(left, UnaryKind::Neg) && unary_node_is(right, UnaryKind::Neg)) {
+                        const ExprId sum = materialize_auxiliary(
+                            make_binary(BinaryKind::Add, left.left, right.left));
+                        if (sum != kNoExpr) emit(source_id, make_unary(UnaryKind::Neg, sum), next);
+                    }
+                }
+
+                if (kind == BinaryKind::Sub) {
+                    const ExprId negated = materialize_auxiliary(
+                        make_unary(UnaryKind::Neg, source.right));
+                    if (negated != kNoExpr) {
+                        emit(source_id, make_binary(BinaryKind::Add, source.left, negated), next);
+                    }
+                }
+
+                if (kind == BinaryKind::Mul) {
+                    if (unary_node_is(right, UnaryKind::Inv)) {
+                        emit(source_id, make_binary(BinaryKind::Div, source.left, right.left), next);
+                    }
+                    if (unary_node_is(left, UnaryKind::Inv)) {
+                        emit(source_id, make_binary(BinaryKind::Div, source.right, left.left), next);
+                    }
+                    if (unary_node_is(left, UnaryKind::Exp) && unary_node_is(right, UnaryKind::Exp)) {
+                        const ExprId sum = materialize_auxiliary(
+                            make_binary(BinaryKind::Add, left.left, right.left));
+                        if (sum != kNoExpr) emit(source_id, make_unary(UnaryKind::Exp, sum), next);
+                    }
+                    if (unary_node_is(left, UnaryKind::Sqrt) && unary_node_is(right, UnaryKind::Sqrt) &&
+                        arena_[left.left].value >= 0.0 && arena_[right.left].value >= 0.0) {
+                        const ExprId product = materialize_auxiliary(
+                            make_binary(BinaryKind::Mul, left.left, right.left));
+                        if (product != kNoExpr) emit(source_id, make_unary(UnaryKind::Sqrt, product), next);
+                    }
+                    if (unary_node_is(left, UnaryKind::Inv) && unary_node_is(right, UnaryKind::Inv)) {
+                        const ExprId product = materialize_auxiliary(
+                            make_binary(BinaryKind::Mul, left.left, right.left));
+                        if (product != kNoExpr) emit(source_id, make_unary(UnaryKind::Inv, product), next);
+                    }
+                    if (left.tag == NodeTag::Binary && right.tag == NodeTag::Binary &&
+                        static_cast<BinaryKind>(left.op) == BinaryKind::Pow &&
+                        static_cast<BinaryKind>(right.op) == BinaryKind::Pow &&
+                        arena_[left.left].hash == arena_[right.left].hash &&
+                        arena_[left.left].value > 0.0) {
+                        const ExprId exponent = materialize_auxiliary(
+                            make_binary(BinaryKind::Add, left.right, right.right));
+                        if (exponent != kNoExpr) {
+                            emit(source_id, make_binary(BinaryKind::Pow, left.left, exponent), next);
+                        }
+                    }
+                }
+
+                if (kind == BinaryKind::Div) {
+                    const ExprId inverse = materialize_auxiliary(
+                        make_unary(UnaryKind::Inv, source.right));
+                    if (inverse != kNoExpr) {
+                        emit(source_id, make_binary(BinaryKind::Mul, source.left, inverse), next);
+                    }
+                    if (unary_node_is(right, UnaryKind::Inv)) {
+                        emit(source_id, make_binary(BinaryKind::Mul, source.left, right.left), next);
+                    }
+                    if (unary_node_is(left, UnaryKind::Inv) && unary_node_is(right, UnaryKind::Inv)) {
+                        emit(source_id, make_binary(BinaryKind::Div, right.left, left.left), next);
+                    }
+                }
+
+
+                if (kind == BinaryKind::Add || kind == BinaryKind::Mul) {
+                    if (left.tag == NodeTag::Binary &&
+                        static_cast<BinaryKind>(left.op) == kind) {
+                        const ExprId inner = materialize_auxiliary(
+                            make_binary(kind, left.right, source.right));
+                        if (inner != kNoExpr) {
+                            emit(source_id, make_binary(kind, left.left, inner), next);
+                        }
+                    }
+                    if (right.tag == NodeTag::Binary &&
+                        static_cast<BinaryKind>(right.op) == kind) {
+                        const ExprId inner = materialize_auxiliary(
+                            make_binary(kind, source.left, right.left));
+                        if (inner != kNoExpr) {
+                            emit(source_id, make_binary(kind, inner, right.right), next);
+                        }
+                    }
+                }
+
+                if (kind == BinaryKind::Pow && left.tag == NodeTag::Binary &&
+                    static_cast<BinaryKind>(left.op) == BinaryKind::Pow &&
+                    arena_[left.left].value > 0.0) {
+                    const ExprId exponent = materialize_auxiliary(
+                        make_binary(BinaryKind::Mul, left.right, source.right));
+                    if (exponent != kNoExpr) {
+                        emit(source_id, make_binary(BinaryKind::Pow, left.left, exponent), next);
+                    }
+                }
+
+                if ((kind == BinaryKind::Add || kind == BinaryKind::Sub) &&
+                    left.tag == NodeTag::Binary && right.tag == NodeTag::Binary) {
+                    const BinaryKind left_kind = static_cast<BinaryKind>(left.op);
+                    const BinaryKind right_kind = static_cast<BinaryKind>(right.op);
+                    if (left_kind == BinaryKind::Div && right_kind == BinaryKind::Div &&
+                        arena_[left.right].hash == arena_[right.right].hash) {
+                        const ExprId numerator = materialize_auxiliary(
+                            make_binary(kind, left.left, right.left));
+                        if (numerator != kNoExpr) {
+                            emit(source_id, make_binary(BinaryKind::Div, numerator, left.right), next);
+                        }
+                    }
+                    if (left_kind == BinaryKind::Mul && right_kind == BinaryKind::Mul) {
+                        const std::array<ExprId, 2> left_factors{left.left, left.right};
+                        const std::array<ExprId, 2> right_factors{right.left, right.right};
+                        bool factored = false;
+                        for (std::size_t li = 0; li < 2 && !factored; ++li) {
+                            for (std::size_t ri = 0; ri < 2 && !factored; ++ri) {
+                                if (arena_[left_factors[li]].hash != arena_[right_factors[ri]].hash) continue;
+                                const ExprId left_remainder = left_factors[1 - li];
+                                const ExprId right_remainder = right_factors[1 - ri];
+                                const ExprId inner = materialize_auxiliary(
+                                    make_binary(kind, left_remainder, right_remainder));
+                                if (inner == kNoExpr) continue;
+                                emit(source_id,
+                                     make_binary(BinaryKind::Mul, left_factors[li], inner), next);
+                                factored = true;
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = std::move(next);
+        }
+
+        sort_touched_layers(touched_cost);
+        if (cfg_.live && !live_candidates.empty()) {
+            live_reporter.consider_batch(live_candidates, cfg_.max_cost);
+            live_reporter.snapshot(cfg_.max_cost);
+        }
+        if (cfg_.verbose) {
+            std::cerr << "egraph_seeds=" << seeds.size()
+                      << " rewrites=" << stats_.egraph_rewrites
+                      << " appended=" << stats_.egraph_candidates << '\n';
+        }
+    }
+
+    void run_mcts_search(LiveTopReporter& live_reporter) {
+        stats_.used_mcts = true;
+        if (cfg_.mcts_iterations == 0 || cfg_.mcts_depth == 0 || cfg_.mcts_branching == 0) return;
+
+        struct TreeNode {
+            ExprId expression{kNoExpr};
+            std::size_t parent{};
+            std::vector<std::size_t> children;
+            std::uint32_t visits{};
+            double reward_sum{};
+            unsigned depth{};
+            std::uint32_t expansion_attempts{};
+        };
+
+        const double search_target = genetic_search_target();
+        const auto reward_for = [&](ExprId id) {
+            const Node& node = arena_[id];
+            const double relative = std::abs(node.value - search_target) /
+                                    std::max(1.0, std::abs(search_target));
+            const double precision = -std::log10(std::max(relative, 1.0e-18));
+            const double elegance = static_cast<double>(node.cost) + 0.12 * node.nodes +
+                                    0.08 * node.depth;
+            const double range_penalty = std::log1p(
+                1.0e6 * genetic_range_violation(node.value - cfg_.target));
+            double reward = precision - cfg_.mcts_elegance * elegance - 8.0 * range_penalty;
+            if (constraint_satisfied(cfg_, node.constraint_state)) reward += 0.5;
+            else reward -= 0.5;
+            if (cfg_.error_range.contains(node.value - cfg_.target)) reward += 0.25;
+            return reward;
+        };
+
+        std::vector<ExprId> ranked;
+        ranked.reserve(arena_.size());
+        for (ExprId id = 0; id < arena_.size(); ++id) {
+            const Node& node = arena_[id];
+            if (node.eligible && !node.depends_on_x && node.cost < cfg_.max_cost) ranked.push_back(id);
+        }
+        std::sort(ranked.begin(), ranked.end(), [&](ExprId left, ExprId right) {
+            const double a = reward_for(left);
+            const double b = reward_for(right);
+            if (a != b) return a > b;
+            const Node& x = arena_[left];
+            const Node& y = arena_[right];
+            if (x.cost != y.cost) return x.cost < y.cost;
+            if (x.nodes != y.nodes) return x.nodes < y.nodes;
+            return x.hash < y.hash;
+        });
+
+        const std::size_t root_limit = std::min<std::size_t>(
+            ranked.size(), std::max<std::size_t>(8, std::min<std::size_t>(128, cfg_.mcts_branching * 4ULL)));
+        std::vector<ExprId> roots;
+        roots.reserve(root_limit);
+        FastSet<std::uint64_t> root_shapes;
+        root_shapes.reserve(root_limit * 2 + 1);
+        for (ExprId id : ranked) {
+            const std::uint64_t shape = candidate_shape_signature(candidate_from_node(id));
+            if (!root_shapes.emplace(shape).second) continue;
+            roots.push_back(id);
+            if (roots.size() == root_limit) break;
+        }
+        if (roots.empty()) return;
+
+        const auto source_layers = extended_layers_snapshot();
+        FastMap<std::uint64_t, ExprId> structure_index = build_structure_index();
+        std::vector<unsigned char> touched_cost(cfg_.max_cost + 1, 0);
+        std::vector<TreeNode> tree;
+        tree.reserve(cfg_.mcts_iterations + roots.size() + 1);
+        tree.push_back({});
+        tree[0].children.reserve(roots.size());
+        for (ExprId id : roots) {
+            const std::size_t index = tree.size();
+            tree.push_back({id, 0, {}, 0, 0.0, 0, 0});
+            tree[0].children.push_back(index);
+        }
+
+        const auto choose_child = [&](std::size_t parent_index) {
+            const TreeNode& parent = tree[parent_index];
+            std::size_t best = parent.children.front();
+            double best_score = -std::numeric_limits<double>::infinity();
+            const double logarithm = std::log(static_cast<double>(parent.visits) + 2.0);
+            for (std::size_t child_index : parent.children) {
+                const TreeNode& child = tree[child_index];
+                const double score = child.visits == 0
+                    ? std::numeric_limits<double>::infinity()
+                    : child.reward_sum / child.visits + cfg_.mcts_exploration *
+                          std::sqrt(logarithm / child.visits);
+                if (score > best_score || (score == best_score && child_index < best)) {
+                    best = child_index;
+                    best_score = score;
+                }
+            }
+            return best;
+        };
+        const auto backpropagate = [&](std::size_t index, double reward) {
+            for (;;) {
+                TreeNode& node = tree[index];
+                ++node.visits;
+                node.reward_sum += reward;
+                if (index == 0) break;
+                index = node.parent;
+            }
+        };
+
+        const auto propose = [&](ExprId current_id, std::uint64_t random) -> std::optional<Candidate> {
+            const Node& current = arena_[current_id];
+            const bool can_unary = !unary_ops_.empty();
+            const bool can_binary = !binary_ops_.empty();
+            if (!can_unary && !can_binary) return std::nullopt;
+
+            const bool choose_unary = can_unary &&
+                (!can_binary || (random & 3ULL) == 0ULL);
+            if (choose_unary) {
+                const UnarySpec& operation = unary_ops_[static_cast<std::size_t>(random % unary_ops_.size())];
+                const unsigned total_cost = static_cast<unsigned>(current.cost) + operation.cost;
+                if (total_cost > cfg_.max_cost) return std::nullopt;
+                ++stats_.attempted;
+                ++stats_.mcts_expansions;
+                ++stats_.by_cost[total_cost].attempted;
+                auto candidate = apply_unary(
+                    cfg_, arena_, operation, current_id, static_cast<std::uint16_t>(total_cost));
+                if (candidate) {
+                    ++stats_.valid;
+                    ++stats_.by_cost[total_cost].valid;
+                }
+                return candidate;
+            }
+
+            const BinarySpec& operation = binary_ops_[static_cast<std::size_t>(random % binary_ops_.size())];
+            if (static_cast<unsigned>(current.cost) + operation.cost + 1U > cfg_.max_cost) {
+                return std::nullopt;
+            }
+            const bool current_on_left = is_commutative(operation.kind) || ((random >> 8U) & 1ULL) == 0ULL;
+            const auto desired = current_on_left
+                ? desired_right(operation.kind, current.value, search_target)
+                : desired_left(operation.kind, current.value, search_target);
+            const unsigned maximum_partner_cost = cfg_.max_cost - current.cost - operation.cost;
+
+            ExprId partner = kNoExpr;
+            std::vector<std::pair<double, ExprId>> near_candidates;
+            near_candidates.reserve(static_cast<std::size_t>(maximum_partner_cost) * 4 + 4);
+            if (desired && std::isfinite(*desired) && ((random >> 12U) & 3ULL) != 0ULL) {
+                for (unsigned cost = 1; cost <= maximum_partner_cost && cost < source_layers.size(); ++cost) {
+                    const auto& ids = source_layers[cost];
+                    if (ids.empty()) continue;
+                    const std::size_t position = lower_bound_value(ids, arena_, *desired);
+                    const std::size_t radius = std::min<std::size_t>(
+                        2, std::max<std::size_t>(1, cfg_.mcts_branching / 4));
+                    const std::size_t begin = position > radius ? position - radius : 0;
+                    const std::size_t end = std::min(ids.size(), position + radius + 1);
+                    for (std::size_t index = begin; index < end; ++index) {
+                        const ExprId id = ids[index];
+                        const double error = std::abs(arena_[id].value - *desired) /
+                                             std::max(1.0, std::abs(*desired));
+                        const double score = error + 1.0e-5 * cfg_.mcts_elegance *
+                                                       (arena_[id].cost + 0.1 * arena_[id].nodes);
+                        near_candidates.emplace_back(score, id);
+                    }
+                }
+                std::sort(near_candidates.begin(), near_candidates.end(), [&](const auto& left, const auto& right) {
+                    if (left.first != right.first) return left.first < right.first;
+                    const Node& a = arena_[left.second];
+                    const Node& b = arena_[right.second];
+                    if (a.cost != b.cost) return a.cost < b.cost;
+                    if (a.nodes != b.nodes) return a.nodes < b.nodes;
+                    return a.hash < b.hash;
+                });
+                if (!near_candidates.empty()) {
+                    const std::size_t choice_count = std::min<std::size_t>(
+                        cfg_.mcts_branching, near_candidates.size());
+                    partner = near_candidates[
+                        static_cast<std::size_t>((random >> 24U) % choice_count)].second;
+                }
+            }
+            if (partner == kNoExpr) {
+                std::vector<unsigned> available_costs;
+                available_costs.reserve(maximum_partner_cost);
+                for (unsigned cost = 1;
+                     cost <= maximum_partner_cost && cost < source_layers.size(); ++cost) {
+                    if (!source_layers[cost].empty()) available_costs.push_back(cost);
+                }
+                if (available_costs.empty()) return std::nullopt;
+                const unsigned partner_cost = available_costs[
+                    static_cast<std::size_t>((random >> 16U) % available_costs.size())];
+                const auto& ids = source_layers[partner_cost];
+                partner = ids[static_cast<std::size_t>((random >> 32U) % ids.size())];
+            }
+
+            const unsigned total_cost = static_cast<unsigned>(current.cost) +
+                                        arena_[partner].cost + operation.cost;
+            ++stats_.attempted;
+            ++stats_.mcts_expansions;
+            ++stats_.by_cost[total_cost].attempted;
+            auto candidate = current_on_left
+                ? apply_binary(cfg_, arena_, operation, current_id, partner,
+                               static_cast<std::uint16_t>(total_cost))
+                : apply_binary(cfg_, arena_, operation, partner, current_id,
+                               static_cast<std::uint16_t>(total_cost));
+            if (candidate) {
+                ++stats_.valid;
+                ++stats_.by_cost[total_cost].valid;
+            }
+            return candidate;
+        };
+
+        std::vector<Candidate> live_candidates;
+        live_candidates.reserve(128);
+        std::size_t stagnant = 0;
+        for (std::size_t iteration = 0; iteration < cfg_.mcts_iterations; ++iteration) {
+            std::size_t selected_index = 0;
+            while (!tree[selected_index].children.empty()) {
+                if (selected_index != 0) {
+                    const TreeNode& selected = tree[selected_index];
+                    const std::size_t width = std::min<std::size_t>(
+                        cfg_.mcts_branching,
+                        1 + static_cast<std::size_t>(std::sqrt(static_cast<double>(selected.visits + 1))));
+                    if (selected.depth < cfg_.mcts_depth && selected.children.size() < width) break;
+                }
+                selected_index = choose_child(selected_index);
+            }
+
+            TreeNode& selected = tree[selected_index];
+            if (selected_index == 0 || selected.depth >= cfg_.mcts_depth) {
+                const double reward = selected_index == 0 ? -1.0 : reward_for(selected.expression);
+                backpropagate(selected_index, reward);
+                continue;
+            }
+
+            bool expanded = false;
+            for (unsigned attempt = 0; attempt < std::max(4U, cfg_.mcts_branching); ++attempt) {
+                const std::uint64_t random = mix64(
+                    cfg_.mcts_seed ^ arena_[selected.expression].hash ^
+                    (static_cast<std::uint64_t>(iteration) * 0x9e3779b97f4a7c15ULL) ^
+                    static_cast<std::uint64_t>(selected.expansion_attempts++));
+                const auto candidate = propose(selected.expression, random);
+                if (!candidate) continue;
+                bool newly_eligible = false;
+                const ExprId id = materialize_candidate(
+                    *candidate, structure_index, touched_cost, true, true, &newly_eligible);
+                if (id == kNoExpr || !newly_eligible) continue;
+
+                const std::size_t child_index = tree.size();
+                tree.push_back({id, selected_index, {}, 0, 0.0, selected.depth + 1, 0});
+                tree[selected_index].children.push_back(child_index);
+                ++stats_.mcts_candidates;
+                live_candidates.push_back(candidate_from_node(id));
+                backpropagate(child_index, reward_for(id));
+                expanded = true;
+                stagnant = 0;
+                break;
+            }
+            if (!expanded) {
+                ++stagnant;
+                backpropagate(selected_index, reward_for(selected.expression) - 0.25);
+            }
+            if (cfg_.live && live_candidates.size() >= 128) {
+                live_reporter.consider_batch(live_candidates, cfg_.max_cost);
+                live_candidates.clear();
+            }
+            if (stagnant >= 2048) break;
+        }
+
+        sort_touched_layers(touched_cost);
+        if (cfg_.live && !live_candidates.empty()) {
+            live_reporter.consider_batch(live_candidates, cfg_.max_cost);
+        }
+        if (cfg_.live) live_reporter.snapshot(cfg_.max_cost);
+        if (cfg_.verbose) {
+            std::cerr << "mcts_roots=" << roots.size()
+                      << " expansions=" << stats_.mcts_expansions
+                      << " appended=" << stats_.mcts_candidates << '\n';
         }
     }
 
@@ -5374,6 +6527,11 @@ static std::string latex_escape(std::string_view text) {
 static std::string render_atom_latex(std::string_view atom) {
     if (atom == "pi") return "\\pi";
     if (atom == "phi") return "\\varphi";
+    if (atom == "gamma") return "\\gamma";
+    if (atom == "catalan") return "G";
+    if (atom == "tau") return "\\tau";
+    if (atom == "ln2") return "\\ln 2";
+    if (atom == "sqrt2") return "\\sqrt{2}";
     if (atom == "e" || atom == "x") return std::string(atom);
     const bool numeric = !atom.empty() && std::all_of(atom.begin(), atom.end(), [](const char c) {
         return (c >= '0' && c <= '9') || c == '.';
@@ -6175,6 +7333,9 @@ static std::string search_strategy_name(const SearchStats& stats) {
     if (stats.used_inverse_templates) name += "+inverse";
     if (stats.used_deep_compositions) name += "+deep";
     if (stats.used_exploration) name += "+explore";
+    if (stats.used_egraph) name += "+egraph";
+    if (stats.used_pslq) name += "+pslq";
+    if (stats.used_mcts) name += "+mcts";
     if (stats.used_genetic) name += "+genetic";
     return name;
 }
@@ -6212,9 +7373,23 @@ static void print_stats(const SearchRun& run) {
                   << " genetic_crossovers=" << run.stats.genetic_crossovers
                   << " genetic_crossovers_kept=" << run.stats.genetic_crossovers_kept;
     }
+    if (run.stats.used_egraph) {
+        std::cerr << " egraph_rewrites=" << run.stats.egraph_rewrites
+                  << " egraph_candidates=" << run.stats.egraph_candidates;
+    }
+    if (run.stats.used_pslq) {
+        std::cerr << " pslq_relations=" << run.stats.pslq_relations
+                  << " pslq_candidates=" << run.stats.pslq_candidates;
+    }
+    if (run.stats.used_mcts) {
+        std::cerr << " mcts_expansions=" << run.stats.mcts_expansions
+                  << " mcts_candidates=" << run.stats.mcts_candidates;
+    }
     std::cerr << " stage_seconds=deterministic:" << std::fixed << std::setprecision(3)
               << run.stats.deterministic_seconds << ",mitm:" << run.stats.mitm_seconds
               << ",inverse:" << run.stats.inverse_seconds << ",deep:" << run.stats.deep_seconds
+              << ",egraph:" << run.stats.egraph_seconds << ",pslq:" << run.stats.pslq_seconds
+              << ",mcts:" << run.stats.mcts_seconds
               << ",genetic:" << run.stats.genetic_seconds;
     std::cerr << " time=" << std::fixed << std::setprecision(3) << run.stats.seconds << "s\n";
 }
@@ -6256,10 +7431,19 @@ static void print_equation_results(const SearchRun& run) {
                   << run.stats.genetic_repairs << ", \"genetic_repairs_kept\": "
                   << run.stats.genetic_repairs_kept << ", \"genetic_crossovers\": "
                   << run.stats.genetic_crossovers << ", \"genetic_crossovers_kept\": "
-                  << run.stats.genetic_crossovers_kept << ", \"stage_seconds\": {\"deterministic\": "
+                  << run.stats.genetic_crossovers_kept << ", \"egraph_rewrites\": "
+                  << run.stats.egraph_rewrites << ", \"egraph_candidates\": "
+                  << run.stats.egraph_candidates << ", \"pslq_relations\": "
+                  << run.stats.pslq_relations << ", \"pslq_candidates\": "
+                  << run.stats.pslq_candidates << ", \"mcts_expansions\": "
+                  << run.stats.mcts_expansions << ", \"mcts_candidates\": "
+                  << run.stats.mcts_candidates << ", \"stage_seconds\": {\"deterministic\": "
                   << run.stats.deterministic_seconds << ", \"mitm\": " << run.stats.mitm_seconds
                   << ", \"inverse\": " << run.stats.inverse_seconds << ", \"deep\": "
-                  << run.stats.deep_seconds << ", \"genetic\": " << run.stats.genetic_seconds
+                  << run.stats.deep_seconds << ", \"egraph\": " << run.stats.egraph_seconds
+                  << ", \"pslq\": " << run.stats.pslq_seconds
+                  << ", \"mcts\": " << run.stats.mcts_seconds
+                  << ", \"genetic\": " << run.stats.genetic_seconds
                   << "}, \"seconds\": " << run.stats.seconds << "}\n}\n";
         return;
     }
@@ -6331,10 +7515,19 @@ static void print_results(const SearchRun& run) {
                   << run.stats.genetic_repairs << ", \"genetic_repairs_kept\": "
                   << run.stats.genetic_repairs_kept << ", \"genetic_crossovers\": "
                   << run.stats.genetic_crossovers << ", \"genetic_crossovers_kept\": "
-                  << run.stats.genetic_crossovers_kept << ", \"stage_seconds\": {\"deterministic\": "
+                  << run.stats.genetic_crossovers_kept << ", \"egraph_rewrites\": "
+                  << run.stats.egraph_rewrites << ", \"egraph_candidates\": "
+                  << run.stats.egraph_candidates << ", \"pslq_relations\": "
+                  << run.stats.pslq_relations << ", \"pslq_candidates\": "
+                  << run.stats.pslq_candidates << ", \"mcts_expansions\": "
+                  << run.stats.mcts_expansions << ", \"mcts_candidates\": "
+                  << run.stats.mcts_candidates << ", \"stage_seconds\": {\"deterministic\": "
                   << run.stats.deterministic_seconds << ", \"mitm\": " << run.stats.mitm_seconds
                   << ", \"inverse\": " << run.stats.inverse_seconds << ", \"deep\": "
-                  << run.stats.deep_seconds << ", \"genetic\": " << run.stats.genetic_seconds
+                  << run.stats.deep_seconds << ", \"egraph\": " << run.stats.egraph_seconds
+                  << ", \"pslq\": " << run.stats.pslq_seconds
+                  << ", \"mcts\": " << run.stats.mcts_seconds
+                  << ", \"genetic\": " << run.stats.genetic_seconds
                   << "}, \"seconds\": " << run.stats.seconds << "}\n}\n";
         return;
     }
@@ -6528,7 +7721,11 @@ static void print_help(const char* program) {
         << "  --equation-search MODE    方程配对：stable、wide 或 exhaustive，默认 stable\n"
         << "  --equation-quality MODE   方程质量：strict、local 或 off，默认 strict；strict 会拒绝奇异/周期伪根\n"
         << "  --genetic                 启用确定性搜索播种的遗传混合阶段；可与 portfolio 组合\n"
-        << "  --search-mode MODE        deterministic|genetic|hybrid|portfolio；portfolio 组合逆模板/深搜/多样采样\n"
+        << "  --pslq / --no-pslq       启用/排除整数关系阶段；系数必须由当前表达式库真实构造\n"
+        << "  --egraph / --no-egraph   启用/排除等式饱和化简阶段\n"
+        << "  --mcts / --no-mcts       启用/排除带复杂度奖励的蒙特卡洛树搜索\n"
+        << "  --search-mode MODE        deterministic|genetic|hybrid|pslq|egraph|mcts|portfolio\n"
+        << "                            portfolio 组合逆模板、深搜、PSLQ、e-graph、MCTS 与多样采样\n"
         << "  --genetic-population N    遗传种群大小，默认 4096；指定即自动启用遗传\n"
         << "  --genetic-generations N   遗传迭代代数，默认 64；指定即自动启用遗传\n"
         << "  --genetic-seed N          64 位随机种子，默认 2611923443488327891；指定即启用遗传\n"
@@ -6537,14 +7734,28 @@ static void print_help(const char* program) {
         << "  --genetic-repair-depth N  修复路径深度，1..8，默认 3；指定即自动启用遗传\n"
         << "  --genetic-crossover X     子树交叉概率，0..1，默认 0.25；指定即自动启用遗传\n"
         << "  --genetic-novelty X       结构物种保留比例，0..0.5，默认 0.20；指定即自动启用遗传\n"
-        << "  --genetic-tournament N    选亲锦标赛规模，1..64，默认 4；指定即自动启用遗传\n\n"
+        << "  --genetic-tournament N    选亲锦标赛规模，1..64，默认 4；指定即自动启用遗传\n"
+        << "  --pslq-basis N            整数关系基底候选数，默认 192\n"
+        << "  --pslq-pairs N            三项关系探测对数，默认 4096\n"
+        << "  --pslq-coeff N            系数绝对值上限，1..4096，默认 64\n"
+        << "  --pslq-steps N            每次 PSLQ 最大迭代数，默认 64\n"
+        << "  --pslq-tolerance X        关系残差相对阈值，默认 1e-12\n"
+        << "  --egraph-seeds N          等式饱和种子数，默认 768\n"
+        << "  --egraph-rounds N         饱和轮数，默认 2\n"
+        << "  --egraph-nodes N          新增等价表达式上限，默认 4096\n"
+        << "  --mcts-iterations N       MCTS 迭代预算，默认 8192\n"
+        << "  --mcts-depth N            树扩展深度，默认 4\n"
+        << "  --mcts-branching N        渐进拓宽分支上限，默认 12\n"
+        << "  --mcts-exploration X      UCT 探索系数，默认 1.25\n"
+        << "  --mcts-elegance X         成本、节点数与深度惩罚，默认 0.25\n"
+        << "  --mcts-seed N             64 位可复现种子，默认 1376283091369227076\n\n"
         << "误差、结果与控制：\n"
         << "  --epsilon X               常量模式达到该绝对误差后停止，默认 1e-12\n"
         << "  --error-range RANGE       value-target；方程为 estimated_root-target，默认 (-inf,inf)\n"
         << "  --no-stop                 即使达到 epsilon 仍搜索到 max-cost\n"
         << "  --no-bidirectional        禁用半表达式合并，改用完整逐层搜索\n"
         << "  --results N               输出条数，默认 20\n"
-        << "  --mode pareto|nearest     复杂度-精度前沿或最接近结果，默认 pareto\n"
+        << "  --mode pareto|nearest     复杂度-精度前沿或最接近结果，默认 nearest\n"
         << "  --live                    搜索期间在 stderr 刷新当前 top N（N 取 --results）\n"
         << "  --live-top N              搜索期间在 stderr 刷新当前 top N\n"
         << "  --live-interval SEC       实时刷新最短间隔秒数，默认 2\n"
@@ -6563,6 +7774,7 @@ static void print_help(const char* program) {
         << "  " << program << " 3.141592653589793 --constants none --digits 123456789 --max-literal-len 3 --max-integer 999 --ops '+,-,*,/' --max-cost 9 --beam 6000 --pairs 12000000\n"
         << "  " << program << " 9.89897948556636 --digits 23 --constants none --ops '+,sqrt,^' --max-cost 8 --deep-rounds 1\n"
         << "  " << program << " 520.82418 --max-cost 16 --genetic --genetic-elegance 0.4\n"
+        << "  " << program << " 520.82418 --max-cost 16 --search-mode portfolio --mcts-elegance 0.35\n"
         << "  " << program << " 2 --digits= --constants pi --ops '+,/' --max-cost 7 --symbol-count pi=4\n"
         << "  " << program << " 24 --digits 1234 --max-literal-len 1 --constants none --ops '+,-,*,/' --max-cost 7 --symbol-count 1=1 --symbol-count 2=1 --symbol-count 3=1 --symbol-count 4=1\n"
         << "  " << program << " 0.123456 --constant 'K=0.915965594177219:2' --ops '+,-,*,/,sqrt,ln'\n";
@@ -6849,7 +8061,16 @@ static Config parse_cli(int argc, char** argv) {
     bool have_target = false;
     bool live_top_explicit = false;
     bool genetic_tuning_seen = false;
+    bool pslq_tuning_seen = false;
+    bool egraph_tuning_seen = false;
+    bool mcts_tuning_seen = false;
     bool genetic_mode_requested = false;
+    bool pslq_mode_requested = false;
+    bool egraph_mode_requested = false;
+    bool mcts_mode_requested = false;
+    bool pslq_disabled = false;
+    bool egraph_disabled = false;
+    bool mcts_disabled = false;
     bool portfolio_mode_requested = false;
     bool deterministic_mode_requested = false;
     bool deep_frontier_seen = false;
@@ -6878,6 +8099,30 @@ static Config parse_cli(int argc, char** argv) {
         } else if (arg == "--genetic") {
             cfg.genetic = true;
             genetic_mode_requested = true;
+        } else if (arg == "--pslq") {
+            cfg.pslq = true;
+            pslq_mode_requested = true;
+            pslq_disabled = false;
+        } else if (arg == "--no-pslq") {
+            cfg.pslq = false;
+            pslq_mode_requested = false;
+            pslq_disabled = true;
+        } else if (arg == "--egraph") {
+            cfg.egraph = true;
+            egraph_mode_requested = true;
+            egraph_disabled = false;
+        } else if (arg == "--no-egraph") {
+            cfg.egraph = false;
+            egraph_mode_requested = false;
+            egraph_disabled = true;
+        } else if (arg == "--mcts") {
+            cfg.mcts = true;
+            mcts_mode_requested = true;
+            mcts_disabled = false;
+        } else if (arg == "--no-mcts") {
+            cfg.mcts = false;
+            mcts_mode_requested = false;
+            mcts_disabled = true;
         } else if (arg == "--live") {
             cfg.live = true;
         } else if (arg == "--verbose") {
@@ -6999,8 +8244,12 @@ static Config parse_cli(int argc, char** argv) {
             const std::string search_mode = option_value(i, argc, argv, arg, "--search-mode");
             if (search_mode == "deterministic") deterministic_mode_requested = true;
             else if (search_mode == "genetic" || search_mode == "hybrid") genetic_mode_requested = true;
+            else if (search_mode == "pslq") pslq_mode_requested = true;
+            else if (search_mode == "egraph") egraph_mode_requested = true;
+            else if (search_mode == "mcts") mcts_mode_requested = true;
             else if (search_mode == "portfolio") portfolio_mode_requested = true;
-            else throw std::runtime_error("--search-mode 必须是 deterministic、genetic、hybrid 或 portfolio");
+            else throw std::runtime_error(
+                "--search-mode 必须是 deterministic、genetic、hybrid、pslq、egraph、mcts 或 portfolio");
         } else if (option_matches(arg, "--genetic-population")) {
             cfg.genetic_population = static_cast<std::size_t>(parse_u64(
                 option_value(i, argc, argv, arg, "--genetic-population"), "--genetic-population"));
@@ -7037,6 +8286,66 @@ static Config parse_cli(int argc, char** argv) {
             cfg.genetic_tournament = parse_unsigned(
                 option_value(i, argc, argv, arg, "--genetic-tournament"), "--genetic-tournament");
             genetic_tuning_seen = true;
+        } else if (option_matches(arg, "--pslq-basis")) {
+            cfg.pslq_basis = static_cast<std::size_t>(parse_u64(
+                option_value(i, argc, argv, arg, "--pslq-basis"), "--pslq-basis"));
+            pslq_tuning_seen = true;
+        } else if (option_matches(arg, "--pslq-pairs")) {
+            cfg.pslq_pairs = parse_u64(
+                option_value(i, argc, argv, arg, "--pslq-pairs"), "--pslq-pairs");
+            pslq_tuning_seen = true;
+        } else if (option_matches(arg, "--pslq-coeff")) {
+            const std::uint64_t coefficient = parse_u64(
+                option_value(i, argc, argv, arg, "--pslq-coeff"), "--pslq-coeff");
+            if (coefficient > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                throw std::runtime_error("--pslq-coeff 超出 64 位有符号整数范围");
+            }
+            cfg.pslq_max_coefficient = static_cast<std::int64_t>(coefficient);
+            pslq_tuning_seen = true;
+        } else if (option_matches(arg, "--pslq-steps")) {
+            cfg.pslq_steps = parse_unsigned(
+                option_value(i, argc, argv, arg, "--pslq-steps"), "--pslq-steps");
+            pslq_tuning_seen = true;
+        } else if (option_matches(arg, "--pslq-tolerance")) {
+            cfg.pslq_tolerance = parse_double(
+                option_value(i, argc, argv, arg, "--pslq-tolerance"), "--pslq-tolerance");
+            pslq_tuning_seen = true;
+        } else if (option_matches(arg, "--egraph-seeds")) {
+            cfg.egraph_seeds = static_cast<std::size_t>(parse_u64(
+                option_value(i, argc, argv, arg, "--egraph-seeds"), "--egraph-seeds"));
+            egraph_tuning_seen = true;
+        } else if (option_matches(arg, "--egraph-rounds")) {
+            cfg.egraph_rounds = parse_unsigned(
+                option_value(i, argc, argv, arg, "--egraph-rounds"), "--egraph-rounds");
+            egraph_tuning_seen = true;
+        } else if (option_matches(arg, "--egraph-nodes")) {
+            cfg.egraph_node_limit = static_cast<std::size_t>(parse_u64(
+                option_value(i, argc, argv, arg, "--egraph-nodes"), "--egraph-nodes"));
+            egraph_tuning_seen = true;
+        } else if (option_matches(arg, "--mcts-iterations")) {
+            cfg.mcts_iterations = static_cast<std::size_t>(parse_u64(
+                option_value(i, argc, argv, arg, "--mcts-iterations"), "--mcts-iterations"));
+            mcts_tuning_seen = true;
+        } else if (option_matches(arg, "--mcts-depth")) {
+            cfg.mcts_depth = parse_unsigned(
+                option_value(i, argc, argv, arg, "--mcts-depth"), "--mcts-depth");
+            mcts_tuning_seen = true;
+        } else if (option_matches(arg, "--mcts-branching")) {
+            cfg.mcts_branching = parse_unsigned(
+                option_value(i, argc, argv, arg, "--mcts-branching"), "--mcts-branching");
+            mcts_tuning_seen = true;
+        } else if (option_matches(arg, "--mcts-exploration")) {
+            cfg.mcts_exploration = parse_double(
+                option_value(i, argc, argv, arg, "--mcts-exploration"), "--mcts-exploration");
+            mcts_tuning_seen = true;
+        } else if (option_matches(arg, "--mcts-elegance")) {
+            cfg.mcts_elegance = parse_double(
+                option_value(i, argc, argv, arg, "--mcts-elegance"), "--mcts-elegance");
+            mcts_tuning_seen = true;
+        } else if (option_matches(arg, "--mcts-seed")) {
+            cfg.mcts_seed = parse_u64(
+                option_value(i, argc, argv, arg, "--mcts-seed"), "--mcts-seed");
+            mcts_tuning_seen = true;
         } else if (option_matches(arg, "--results")) {
             cfg.results = static_cast<std::size_t>(parse_u64(option_value(i, argc, argv, arg, "--results"), "--results"));
         } else if (option_matches(arg, "--live-top")) {
@@ -7061,12 +8370,18 @@ static Config parse_cli(int argc, char** argv) {
 
     if (deterministic_mode_requested) {
         cfg.genetic = false;
+        cfg.pslq = false;
+        cfg.egraph = false;
+        cfg.mcts = false;
         cfg.portfolio = false;
     } else if (portfolio_mode_requested) {
         // Portfolio mode composes the existing deterministic engines with
         // bounded defaults.  It is opt-in, so ordinary searches retain their
         // exact performance profile.  Explicitly larger user values win.
         cfg.genetic = genetic_mode_requested || genetic_tuning_seen;
+        cfg.pslq = !pslq_disabled;
+        cfg.egraph = !egraph_disabled;
+        cfg.mcts = !mcts_disabled;
         cfg.portfolio = true;
         cfg.stop_on_epsilon = false;
         cfg.explore_pairs = std::max<std::size_t>(cfg.explore_pairs, cfg.genetic ? 1U : 2U);
@@ -7081,8 +8396,11 @@ static Config parse_cli(int argc, char** argv) {
             cfg.deep_frontier = std::max<std::size_t>(
                 512, std::min<std::size_t>(2'048, std::max<std::size_t>(1, cfg.beam / 4)));
         }
-    } else if (genetic_mode_requested || genetic_tuning_seen) {
-        cfg.genetic = true;
+    } else {
+        if (genetic_mode_requested || genetic_tuning_seen) cfg.genetic = true;
+        if (!pslq_disabled && (pslq_mode_requested || pslq_tuning_seen)) cfg.pslq = true;
+        if (!egraph_disabled && (egraph_mode_requested || egraph_tuning_seen)) cfg.egraph = true;
+        if (!mcts_disabled && (mcts_mode_requested || mcts_tuning_seen)) cfg.mcts = true;
     }
 
     if (cfg.list_symbols) return cfg;
@@ -7135,8 +8453,33 @@ static Config parse_cli(int argc, char** argv) {
     if (cfg.genetic_tournament == 0 || cfg.genetic_tournament > 64) {
         throw std::runtime_error("--genetic-tournament 必须在 1..64 之间");
     }
+    if (cfg.pslq_basis == 0) throw std::runtime_error("--pslq-basis 必须大于 0");
+    if (cfg.pslq_max_coefficient <= 0 || cfg.pslq_max_coefficient > 4096) {
+        throw std::runtime_error("--pslq-coeff 必须在 1..4096 之间");
+    }
+    if (cfg.pslq_steps == 0 || cfg.pslq_steps > 10000) {
+        throw std::runtime_error("--pslq-steps 必须在 1..10000 之间");
+    }
+    if (cfg.pslq_tolerance <= 0.0) throw std::runtime_error("--pslq-tolerance 必须大于 0");
+    if (cfg.egraph_seeds == 0) throw std::runtime_error("--egraph-seeds 必须大于 0");
+    if (cfg.egraph_rounds == 0 || cfg.egraph_rounds > 64) {
+        throw std::runtime_error("--egraph-rounds 必须在 1..64 之间");
+    }
+    if (cfg.egraph_node_limit == 0) throw std::runtime_error("--egraph-nodes 必须大于 0");
+    if (cfg.mcts_iterations == 0) throw std::runtime_error("--mcts-iterations 必须大于 0");
+    if (cfg.mcts_depth == 0 || cfg.mcts_depth > 32) {
+        throw std::runtime_error("--mcts-depth 必须在 1..32 之间");
+    }
+    if (cfg.mcts_branching == 0 || cfg.mcts_branching > 256) {
+        throw std::runtime_error("--mcts-branching 必须在 1..256 之间");
+    }
+    if (cfg.mcts_exploration < 0.0) throw std::runtime_error("--mcts-exploration 不能为负数");
+    if (cfg.mcts_elegance < 0.0) throw std::runtime_error("--mcts-elegance 不能为负数");
     if (cfg.genetic && cfg.equations) {
         throw std::runtime_error("--genetic 暂不能与 --equations 同时使用");
+    }
+    if ((cfg.pslq || cfg.egraph || cfg.mcts) && cfg.equations) {
+        throw std::runtime_error("PSLQ、e-graph 与 MCTS 当前用于常量表达式搜索，不能与 --equations 同时使用");
     }
     if (cfg.portfolio && cfg.equations) {
         throw std::runtime_error("--search-mode portfolio 用于常量搜索；方程请使用 --equation-search wide 或 exhaustive");
@@ -7215,6 +8558,12 @@ static int run_self_test() {
               "有符号负误差区间");
     }
     {
+        std::array<long double, 4> values{2.0L, 1.0L, 0.0L, 0.0L};
+        const auto relation = find_integer_relation(values, 2, 1.0e-15L, 8, 32);
+        check(relation && relation->coefficients[0] == 1 && relation->coefficients[1] == -2,
+              "PSLQ 有界整数关系核心");
+    }
+    {
         const auto tokens = tokenize_response_text(
             "\xef\xbb\xbf# preset\n520.82418 --ops \"+,/,sqrt\" --digits '' # trailing\n"
             "--error-range '(0,1)' @@literal\n",
@@ -7244,6 +8593,10 @@ static int run_self_test() {
             {"fates", "1", "--search-mode", "portfolio"});
         const Config genetic_portfolio = parse_arguments(
             {"fates", "1", "--genetic", "--search-mode", "portfolio"});
+        const Config advanced = parse_arguments(
+            {"fates", "1", "--search-mode", "pslq", "--egraph", "--mcts-iterations", "32"});
+        const Config reduced_portfolio = parse_arguments(
+            {"fates", "1", "--search-mode", "portfolio", "--no-mcts"});
         const Config equation_policy = parse_arguments(
             {"fates", "1", "--equations", "--equation-search", "wide",
              "--equation-quality", "local"});
@@ -7257,7 +8610,10 @@ static int run_self_test() {
                    genetic_portfolio.pareto_slots == 1 &&
                    genetic_portfolio.explore_pairs == 1 &&
                    genetic_portfolio.deep_frontier > 0 &&
-                   equation_policy.equation_search == EquationSearchMode::Wide &&
+                    portfolio.pslq && portfolio.egraph && portfolio.mcts &&
+                    advanced.pslq && advanced.egraph && advanced.mcts &&
+                    reduced_portfolio.pslq && reduced_portfolio.egraph && !reduced_portfolio.mcts &&
+                    equation_policy.equation_search == EquationSearchMode::Wide &&
                    equation_policy.equation_quality == EquationQualityMode::Local,
               "搜索模式、严格数值剪枝与方程策略解析稳定");
     }
@@ -7487,6 +8843,18 @@ static int run_self_test() {
                   first.find("^{2}") == std::string::npos && text == "pi×pi/q" &&
                   inverse == "\\frac{1}{\\pi}" && exponential == "e^{\\pi}",
               "乘除等价式显式叉乘、直观 LaTeX 且不凭空引入幂");
+    }
+    {
+        std::vector<AtomSpec> atoms{{"gamma", 0.5772156649015329, 2},
+                                    {"catalan", 0.915965594177219, 2}};
+        std::vector<Node> arena(2);
+        arena[0].tag = NodeTag::Atom;
+        arena[0].atom_index = 0;
+        arena[1].tag = NodeTag::Atom;
+        arena[1].atom_index = 1;
+        check(render_expression_latex_impl(atoms, arena, 0).text == "\\gamma" &&
+                  render_expression_latex_impl(atoms, arena, 1).text == "G",
+              "Euler-Mascheroni 与 Catalan 常数 LaTeX 符号");
     }
     {
         Config cfg;
@@ -7796,6 +9164,105 @@ static int run_self_test() {
         });
         check(found && run.stats.used_inverse_templates && run.stats.inverse_candidates > 0,
               "Pareto 输出递归 inverse 独占成本层");
+    }
+    {
+        Config cfg;
+        cfg.target = 5.2;
+        cfg.digits = "12345";
+        cfg.constants = "pi,e";
+        cfg.ops = "+,-,*,/,sqrt,ln,exp,neg,inv";
+        cfg.max_cost = 8;
+        cfg.beam = 300;
+        cfg.pair_budget = 50'000;
+        cfg.stop_on_epsilon = false;
+        cfg.pslq = true;
+        cfg.pslq_basis = 32;
+        cfg.pslq_pairs = 64;
+        cfg.pslq_tolerance = 1.0e-5;
+        cfg.egraph = true;
+        cfg.egraph_seeds = 64;
+        cfg.egraph_node_limit = 64;
+        cfg.mcts = true;
+        cfg.mcts_iterations = 128;
+        cfg.mcts_depth = 3;
+        cfg.mcts_branching = 8;
+        cfg.show_stats = false;
+        const SearchRun run = SearchEngine(cfg).run();
+        check(run.stats.used_pslq && run.stats.pslq_relations > 0 &&
+                  run.stats.pslq_candidates > 0 && run.stats.used_egraph &&
+                  run.stats.egraph_rewrites > 0 && run.stats.egraph_candidates > 0 &&
+                  run.stats.used_mcts && run.stats.mcts_expansions > 0 &&
+                  run.stats.mcts_candidates > 0,
+              "PSLQ、e-graph 与 MCTS 组合阶段产出合法候选");
+    }
+    {
+        Config base;
+        base.target = 5.2;
+        base.digits = "12345";
+        base.constants = "pi,e";
+        base.ops = "+,-,*,/,sqrt,ln,exp,neg,inv";
+        base.max_cost = 8;
+        base.beam = 200;
+        base.pair_budget = 20'000;
+        base.stop_on_epsilon = false;
+        base.mcts = true;
+        base.mcts_iterations = 96;
+        base.mcts_depth = 3;
+        base.mcts_branching = 8;
+        base.mcts_seed = 0x5eed1234ULL;
+        base.show_stats = false;
+        Config single_cfg = base;
+        single_cfg.threads = 1;
+        Config parallel_cfg = base;
+        parallel_cfg.threads = 4;
+        const SearchRun single = SearchEngine(single_cfg).run();
+        const SearchRun parallel = SearchEngine(parallel_cfg).run();
+        const auto hashes = [](const SearchRun& run) {
+            std::vector<std::uint64_t> result;
+            for (const Node& node : run.arena) {
+                if (node.eligible) result.push_back(node.hash);
+            }
+            return result;
+        };
+        check(single.stats.mcts_candidates > 0 && hashes(single) == hashes(parallel) &&
+                  single.stats.mcts_expansions == parallel.stats.mcts_expansions &&
+                  single.stats.mcts_candidates == parallel.stats.mcts_candidates,
+              "MCTS 固定种子跨线程确定性");
+    }
+    {
+        Config cfg;
+        cfg.target = -4.0;
+        cfg.digits = "145";
+        cfg.max_literal_len = 1;
+        cfg.constants = "none";
+        cfg.ops = "-";
+        cfg.max_cost = 11;
+        cfg.beam = 1'000;
+        cfg.pair_budget = 500'000;
+        cfg.mode = "nearest";
+        cfg.results = 10;
+        cfg.symbol_count_specs = {"1=3", "4=2", "5=1"};
+        cfg.required_symbol_order = {"1", "1", "4", "5", "1", "4"};
+        cfg.pslq = true;
+        cfg.pslq_basis = 32;
+        cfg.pslq_pairs = 64;
+        cfg.egraph = true;
+        cfg.egraph_seeds = 64;
+        cfg.egraph_rounds = 1;
+        cfg.egraph_node_limit = 64;
+        cfg.mcts = true;
+        cfg.mcts_iterations = 128;
+        cfg.mcts_depth = 3;
+        cfg.mcts_branching = 8;
+        cfg.show_stats = false;
+        const SearchRun run = SearchEngine(cfg).run();
+        const auto matches = collect_matches(run);
+        const bool found = std::any_of(matches.begin(), matches.end(), [&](const Match& match) {
+            return match.value == cfg.target &&
+                   render_expression(run, match.id).text == "1-(1-4)-(5-(1-4))";
+        });
+        check(found && run.stats.used_pslq && run.stats.used_egraph && run.stats.used_mcts,
+              "高级阶段遵守符号次数与叶子顺序约束");
     }
     {
         Config cfg;

@@ -47,6 +47,7 @@
         <button type="button" data-preset="quick">快速</button>
         <button type="button" data-preset="balanced">均衡</button>
         <button type="button" data-preset="deep">深搜</button>
+        <button type="button" data-preset="portfolio">组合</button>
         <button type="button" data-preset="genetic">遗传</button>
         <button type="button" data-preset="equation">方程</button>
         <button type="button" data-preset="four-pi">四 π</button>
@@ -73,9 +74,9 @@
             <div class="field-grid">
               <label class="field">
                 <span>结果模式 <code>--mode</code></span>
-                <select id="mode" data-option="--mode" data-default="pareto">
+                <select id="mode" data-option="--mode" data-default="nearest">
                   <option value="pareto">Pareto · 简洁/精度前沿</option>
-                  <option value="nearest">Nearest · 最近结果</option>
+                  <option value="nearest" selected>Nearest · 最近结果</option>
                 </select>
               </label>
               <label class="field">
@@ -356,6 +357,9 @@
                   <option value="deterministic">deterministic</option>
                   <option value="hybrid">hybrid</option>
                   <option value="genetic">genetic</option>
+                  <option value="pslq">pslq</option>
+                  <option value="egraph">egraph</option>
+                  <option value="mcts">mcts</option>
                   <option value="portfolio">portfolio</option>
                 </select>
               </label>
@@ -402,9 +406,109 @@
           </div>
         </details>
 
+        <details class="option-group" data-search-text="pslq integer relation egraph equality saturation mcts monte carlo tree elegance advanced portfolio 整数关系 等式饱和 蒙特卡洛 优雅 高级 组合">
+          <summary>
+            <span><b>06</b> 高级搜索算法</span>
+            <small>Optional search stages</small>
+          </summary>
+          <div class="group-body">
+            <div class="field-grid three-columns">
+              <label class="field">
+                <span>PSLQ 阶段</span>
+                <select id="pslqPolicy" data-default="auto">
+                  <option value="auto" selected>自动（portfolio 启用）</option>
+                  <option value="enabled">启用 · --pslq</option>
+                  <option value="disabled">排除 · --no-pslq</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>关系基底 <code>--pslq-basis</code></span>
+                <input id="pslqBasis" type="number" min="1" value="192" data-option="--pslq-basis" data-default="192">
+              </label>
+              <label class="field">
+                <span>基底配对 <code>--pslq-pairs</code></span>
+                <input id="pslqPairs" type="number" min="0" value="4096" data-option="--pslq-pairs" data-default="4096">
+              </label>
+              <label class="field">
+                <span>系数上限 <code>--pslq-coeff</code></span>
+                <input id="pslqCoeff" type="number" min="1" max="4096" value="64" data-option="--pslq-coeff" data-default="64">
+              </label>
+              <label class="field">
+                <span>迭代步数 <code>--pslq-steps</code></span>
+                <input id="pslqSteps" type="number" min="1" max="10000" value="64" data-option="--pslq-steps" data-default="64">
+              </label>
+              <label class="field">
+                <span>关系容差 <code>--pslq-tolerance</code></span>
+                <input id="pslqTolerance" type="text" value="1e-12" data-option="--pslq-tolerance" data-default="1e-12">
+              </label>
+            </div>
+
+            <div class="field-grid three-columns algorithm-block">
+              <label class="field">
+                <span>e-graph 阶段</span>
+                <select id="egraphPolicy" data-default="auto">
+                  <option value="auto" selected>自动（portfolio 启用）</option>
+                  <option value="enabled">启用 · --egraph</option>
+                  <option value="disabled">排除 · --no-egraph</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>饱和种子 <code>--egraph-seeds</code></span>
+                <input id="egraphSeeds" type="number" min="1" value="768" data-option="--egraph-seeds" data-default="768">
+              </label>
+              <label class="field">
+                <span>饱和轮数 <code>--egraph-rounds</code></span>
+                <input id="egraphRounds" type="number" min="1" max="64" value="2" data-option="--egraph-rounds" data-default="2">
+              </label>
+              <label class="field">
+                <span>节点预算 <code>--egraph-nodes</code></span>
+                <input id="egraphNodes" type="number" min="1" value="4096" data-option="--egraph-nodes" data-default="4096">
+              </label>
+            </div>
+
+            <div class="field-grid three-columns algorithm-block">
+              <label class="field">
+                <span>MCTS 阶段</span>
+                <select id="mctsPolicy" data-default="auto">
+                  <option value="auto" selected>自动（portfolio 启用）</option>
+                  <option value="enabled">启用 · --mcts</option>
+                  <option value="disabled">排除 · --no-mcts</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>迭代预算 <code>--mcts-iterations</code></span>
+                <input id="mctsIterations" type="number" min="1" value="8192" data-option="--mcts-iterations" data-default="8192">
+              </label>
+              <label class="field">
+                <span>树深度 <code>--mcts-depth</code></span>
+                <input id="mctsDepth" type="number" min="1" max="32" value="4" data-option="--mcts-depth" data-default="4">
+              </label>
+              <label class="field">
+                <span>分支上限 <code>--mcts-branching</code></span>
+                <input id="mctsBranching" type="number" min="1" max="256" value="12" data-option="--mcts-branching" data-default="12">
+              </label>
+              <label class="field">
+                <span>探索系数 <code>--mcts-exploration</code></span>
+                <input id="mctsExploration" type="number" min="0" step="0.05" value="1.25" data-option="--mcts-exploration" data-default="1.25">
+              </label>
+              <label class="field">
+                <span>优雅惩罚 <code>--mcts-elegance</code></span>
+                <input id="mctsElegance" type="number" min="0" step="0.05" value="0.25" data-option="--mcts-elegance" data-default="0.25">
+              </label>
+              <label class="field">
+                <span>随机种子 <code>--mcts-seed</code></span>
+                <input id="mctsSeed" type="text" value="1376283091369227076" data-option="--mcts-seed" data-default="1376283091369227076">
+              </label>
+            </div>
+            <div class="mode-note">
+              PSLQ 只采用当前表达式库能真实构造的整数系数；e-graph 优先提取低成本等价式；MCTS 的奖励同时考虑误差、成本、节点数、深度和误差区间。
+            </div>
+          </div>
+        </details>
+
         <details class="option-group" data-search-text="live json dry run verbose stats output real time 实时 输出 JSON 统计">
           <summary>
-            <span><b>06</b> 实时与诊断输出</span>
+            <span><b>07</b> 实时与诊断输出</span>
             <small>Live &amp; diagnostics</small>
           </summary>
           <div class="group-body">
@@ -470,7 +574,7 @@
         <div class="hero-copy">
           <span class="eyebrow">EXPRESSION SEARCH</span>
           <h2>让数值找到优雅的表达式。</h2>
-          <p>确定性双向搜索、递归逆模板、深层组合与可复现遗传探索，共享同一套成本和合法性规则。</p>
+          <p>双向搜索、逆模板、等式饱和、整数关系、MCTS 与遗传探索，共享同一套成本和合法性规则。</p>
         </div>
         <div class="hero-orbit" aria-hidden="true">
           <span>π</span><span>e</span><span>√</span><span>φ</span>

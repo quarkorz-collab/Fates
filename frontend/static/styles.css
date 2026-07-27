@@ -427,6 +427,12 @@ pre {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.algorithm-block {
+  padding-top: 3px;
+  margin-top: 13px;
+  border-top: 1px solid var(--line);
+}
+
 .field {
   display: block;
   min-width: 0;
@@ -1126,8 +1132,8 @@ th {
 
 th:first-child,
 td:first-child,
-th:last-child,
-td:last-child {
+th:nth-child(3),
+td.expression-cell {
   text-align: left;
 }
 
@@ -1140,7 +1146,7 @@ td:first-child {
   color: var(--quiet);
 }
 
-td:last-child {
+td.expression-cell {
   max-width: 560px;
   color: var(--acid);
   overflow: hidden;

@@ -17,7 +17,7 @@ Fates 根据给定的目标值，搜索由数字、常数和运算符组成的�
 - 分层搜索、beam 限制、二元组合预算和数值去重；
 - 常量表达式和方程两种搜索模式；
 - 自定义数字、常数、运算符、符号次数和叶子顺序；
-- 双向搜索、递归逆模板、深层组合和可选的遗传搜索；
+- 双向搜索、递归逆模板、深层组合，以及可选的 PSLQ、等式饱和、MCTS 和遗传搜索；
 - 普通文本、LaTeX、JSON 和实时结果输出；
 - UTF-8 参数文件和源码扩展接口；
 - 内置本地网页界面，静态资源包含 KaTeX，无需联网渲染公式。
@@ -75,7 +75,7 @@ Linux 上使用 GCC 构建相同训练标准的 PGO 版本：
 bash scripts/build-pgo-linux.sh --enable-avx2 --training balanced
 ```
 
-默认输出到 `artifacts/linux-x64-pgo-avx2/`。正式发布构建固定使用 `balanced`。Windows 和 Linux 都读取 [`scripts/pgo-workloads.json`](scripts/pgo-workloads.json) 中的 `release-balanced-v1`：版本启动、自测、确定性搜索、遗传搜索、方程搜索和 portfolio 搜索六项训练负载均与最终性能优化时使用的负载一致。`build-info.txt` 会记录 profile 名和训练文件 SHA-256，便于核对发布包没有使用缩减训练。
+默认输出到 `artifacts/linux-x64-pgo-avx2/`。正式发布构建固定使用 `balanced`。Windows 和 Linux 都读取 [`scripts/pgo-workloads.json`](scripts/pgo-workloads.json) 中的 `release-balanced-v2`：版本启动、自测、确定性搜索、遗传搜索、方程搜索和带受控高级预算的 portfolio 搜索使用同一组训练负载。`build-info.txt` 会记录 profile 名和训练文件 SHA-256，便于核对发布包没有使用缩减训练。
 
 PGO 配置文件与生成它的源码、编译器版本和编译选项绑定，不能可靠地跨版本复用，因此脚本每次都从当前源码重新训练。
 
@@ -185,7 +185,7 @@ PowerShell 中建议给区间加引号，以保留括号的开闭含义。
   --max-cost 5 --mode nearest
 ```
 
-`--equation-quality` 可选 `strict`、`local` 或 `off`。默认模式会对候选根重新求值，并检查邻域定义域和导数。方程模式不支持遗传阶段、递归逆模板和深层组合。
+`--equation-quality` 可选 `strict`、`local` 或 `off`。默认模式会对候选根重新求值，并检查邻域定义域和导数。方程模式不支持遗传、PSLQ、e-graph、MCTS、递归逆模板和深层组合。
 
 ### 搜索扩展
 
@@ -195,10 +195,19 @@ PowerShell 中建议给区间加引号，以保留括号的开闭含义。
 --inverse-depth 1 --inverse-beam 64 --inverse-budget 1000000
 --deep-rounds 1 --deep-beam 100
 --pareto-slots 2 --pareto-extra 750
+--pslq --pslq-basis 192 --pslq-pairs 4096 --pslq-coeff 64
+--egraph --egraph-seeds 768 --egraph-rounds 2 --egraph-nodes 4096
+--mcts --mcts-iterations 8192 --mcts-depth 4 --mcts-branching 12
 --genetic --genetic-population 4096 --genetic-generations 64
 ```
 
-这些阶段会增加搜索时间或内存。`--search-mode portfolio` 会组合部分扩展；需要可复现结果时，应固定目标、全部参数、线程数和 `--genetic-seed`。
+PSLQ 从现有低成本表达式中寻找小整数关系。整数系数不会作为隐藏常数注入：只有当前数字、常数和运算符已经能构造该整数时，关系才会成为候选。`--pslq-coeff` 同时限制搜索规模和表达式可读性。
+
+e-graph 使用受预算的等式饱和与最低成本提取，处理公因式、同分母、指数/对数/根式组合及等价运算形式。每个重写结果都会重新经过定义域、成本、符号次数、符号顺序和源码约束检查。
+
+MCTS 使用渐进拓宽和 UCT，在目标反推近邻中扩展表达式。奖励同时考虑误差、误差区间、成本、节点数和深度；`--mcts-elegance` 越大，越偏向短而清楚的式子。固定 `--mcts-seed` 后结果可复现。
+
+这些阶段会增加搜索时间或内存。`--search-mode pslq|egraph|mcts` 可单独选择一种，`--search-mode portfolio` 会组合全部高级阶段；可用 `--no-pslq`、`--no-egraph` 或 `--no-mcts` 从 portfolio 中排除单项。未启用时不会进入普通搜索热路径。需要可复现结果时，应固定目标、全部参数、线程数和随机种子。
 
 ## 输出和实时结果
 
@@ -206,7 +215,7 @@ PowerShell 中建议给区间加引号，以保留括号的开闭含义。
 
 ```text
 --mode pareto       按复杂度和误差输出前沿
---mode nearest      按误差输出结果
+--mode nearest      按误差输出结果（默认）
 --results N         输出 N 条结果
 --json              输出 JSON
 --latex             在普通输出中显示 LaTeX
@@ -269,7 +278,7 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 | `--equation-search MODE` | `stable`、`wide` 或 `exhaustive` | `stable` |
 | `--equation-quality MODE` | `strict`、`local` 或 `off` | `strict` |
 | `--genetic` | 启用遗传混合阶段 | 关闭 |
-| `--search-mode MODE` | `deterministic`、`genetic`、`hybrid` 或 `portfolio` | `deterministic` |
+| `--search-mode MODE` | `deterministic`、`genetic`、`hybrid`、`pslq`、`egraph`、`mcts` 或 `portfolio` | `deterministic` |
 | `--genetic-population N` | 种群规模和每代试验数 | `4096` |
 | `--genetic-generations N` | 最大代数 | `64` |
 | `--genetic-seed N` | 随机种子 | `2611923443488327891` |
@@ -279,11 +288,28 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 | `--genetic-crossover X` | 子树交叉概率 | `0.25` |
 | `--genetic-novelty X` | 结构代表比例 | `0.20` |
 | `--genetic-tournament N` | 选亲锦标赛规模 | `4` |
+| `--pslq` / `--no-pslq` | 启用 PSLQ，或从 portfolio 排除 | 关闭 |
+| `--pslq-basis N` | 关系基底候选数 | `192` |
+| `--pslq-pairs N` | 三项关系配对预算 | `4096` |
+| `--pslq-coeff N` | 整数系数绝对值上限 | `64` |
+| `--pslq-steps N` | 每次关系迭代上限 | `64` |
+| `--pslq-tolerance X` | 关系残差相对阈值 | `1e-12` |
+| `--egraph` / `--no-egraph` | 启用等式饱和，或从 portfolio 排除 | 关闭 |
+| `--egraph-seeds N` | 等式饱和种子数 | `768` |
+| `--egraph-rounds N` | 饱和轮数 | `2` |
+| `--egraph-nodes N` | 新增等价表达式上限 | `4096` |
+| `--mcts` / `--no-mcts` | 启用 MCTS，或从 portfolio 排除 | 关闭 |
+| `--mcts-iterations N` | MCTS 迭代预算 | `8192` |
+| `--mcts-depth N` | 树扩展深度 | `4` |
+| `--mcts-branching N` | 渐进拓宽分支上限 | `12` |
+| `--mcts-exploration X` | UCT 探索系数 | `1.25` |
+| `--mcts-elegance X` | 成本、节点数和深度惩罚 | `0.25` |
+| `--mcts-seed N` | MCTS 随机种子 | `1376283091369227076` |
 | `--error-range RANGE` | 有符号误差区间 | `(-inf,inf)` |
 | `--epsilon X` | 达到该误差后停止 | `1e-12` |
 | `--no-stop` | 不因误差阈值停止 | 关闭 |
 | `--results N` | 输出结果数 | `20` |
-| `--mode MODE` | `pareto` 或 `nearest` | `pareto` |
+| `--mode MODE` | `pareto` 或 `nearest` | `nearest` |
 | `--live` | 输出实时结果 | 关闭 |
 | `--live-top N` | 实时结果数量 | 关闭 |
 | `--live-interval SEC` | 实时刷新间隔 | `2` |
@@ -305,6 +331,7 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 - 表达式按复杂度分层生成，候选使用紧凑 AST 索引保存，最后一步才渲染文本；
 - 数值分桶、成本上限和组合预算共同控制候选数量；
 - 默认模式先生成单边表达式，再通过 meet-in-the-middle 合并；
+- 高级阶段统一复用 AST 求值、成本和约束状态转移，不创建绕过符号集合的隐式常数；
 - 方程模式额外保存目标点处的导数，并对候选根做数值复核；
 - 源码扩展可以注册运算和结构约束，详见 [`docs/EXTENDING.md`](docs/EXTENDING.md)。
 

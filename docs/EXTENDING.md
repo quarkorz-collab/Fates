@@ -89,7 +89,7 @@ average.desired_right = [](double left, double target) {
 extensions.add_binary(std::move(average));
 ```
 
-`desired_left` 和 `desired_right` 为双向、深层和遗传搜索提供目标值反推。省略它们不影响普通分层求值，但会减少目标导向候选。只有数学上满足交换律时才设置 `commutative = true`。
+`desired_left` 和 `desired_right` 为双向、深层、MCTS 和遗传搜索提供目标值反推。省略它们不影响普通分层求值，但会减少目标导向候选。只有数学上满足交换律时才设置 `commutative = true`。
 
 ## 结构约束
 
@@ -149,6 +149,20 @@ extensions.add_constraint(std::move(rule));
 7. `--list-symbols --json` 元数据和自测。
 
 原生枚举值必须小于 64，`64..255` 保留给源码扩展。新增原生运算默认不要加入 `Config::ops`，除非这是有意的兼容性改变。
+
+## 扩展搜索阶段
+
+高级阶段的调度位于 `SearchEngine::run()`。新增阶段应遵守以下约定：
+
+1. 默认关闭，避免改变普通搜索的候选计数和性能；
+2. 只通过 `apply_unary()`、`apply_binary()` 和已有原子构造表达式；
+3. 不直接写入任意数值节点，也不复制旧节点的约束状态；
+4. 使用独立预算，并把尝试数、保留数和耗时加入 `SearchStats` 与 JSON；
+5. 新增候选按成本写入 `layers_`，随后恢复按数值排序；
+6. 固定随机种子时，候选次序应与线程数无关；
+7. 同步更新 CLI、`--help`、网页命令导入、README、PGO 负载和自测。
+
+PSLQ 的整数系数通过当前 AST 中的整数表达式实现；e-graph 重写必须说明实数定义域条件；目标导向算法应同时惩罚成本、节点数和深度，避免只按数值误差扩展。
 
 ## 前端目录发现
 

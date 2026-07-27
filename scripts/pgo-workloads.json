@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile": "release-balanced-v1",
+  "profile": "release-balanced-v2",
   "base": [
     {
       "name": "version startup",
@@ -41,7 +41,11 @@
       "name": "portfolio search",
       "arguments": [
         "520.82418", "--mode", "nearest", "--max-cost", "12", "--beam", "1000",
-        "--pairs", "500000", "--search-mode", "portfolio", "--no-stop", "--json"
+        "--pairs", "500000", "--search-mode", "portfolio",
+        "--pslq-basis", "64", "--pslq-pairs", "256",
+        "--egraph-seeds", "128", "--egraph-rounds", "1", "--egraph-nodes", "256",
+        "--mcts-iterations", "512", "--mcts-depth", "3", "--mcts-branching", "8",
+        "--no-stop", "--json"
       ]
     }
   ]

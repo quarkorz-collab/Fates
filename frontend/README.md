@@ -4,6 +4,8 @@
 
 启动时，服务器会从 `fates.exe --list-symbols --json` 读取常数和运算符目录，因此源码扩展会出现在网页表单中。KaTeX、样式和字体已放在 `static/vendor/katex`，离线时也可以渲染公式。
 
+界面覆盖命令行的确定性、方程、遗传、PSLQ、e-graph、MCTS 和 portfolio 配置。高级阶段使用“自动 / 启用 / 排除”三态选择：自动状态在 portfolio 中启用，排除状态会生成对应的 `--no-*` 参数。命令框支持导入这些选项，结果可随时在 KaTeX 和纯文本之间切换并复制 LaTeX 源码。
+
 ## 从源码运行
 
 ```powershell

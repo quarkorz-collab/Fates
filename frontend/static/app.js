@@ -38,6 +38,16 @@ const geneticFieldIds = [
   "geneticNovelty",
   "geneticTournament",
 ];
+const pslqFieldIds = ["pslqBasis", "pslqPairs", "pslqCoeff", "pslqSteps", "pslqTolerance"];
+const egraphFieldIds = ["egraphSeeds", "egraphRounds", "egraphNodes"];
+const mctsFieldIds = [
+  "mctsIterations", "mctsDepth", "mctsBranching", "mctsExploration", "mctsElegance", "mctsSeed",
+];
+const advancedPolicies = {
+  pslq: { control: "pslqPolicy", enable: "--pslq", disable: "--no-pslq", fields: pslqFieldIds },
+  egraph: { control: "egraphPolicy", enable: "--egraph", disable: "--no-egraph", fields: egraphFieldIds },
+  mcts: { control: "mctsPolicy", enable: "--mcts", disable: "--no-mcts", fields: mctsFieldIds },
+};
 
 let symbolCatalog = null;
 
@@ -82,6 +92,12 @@ const presets = {
     paretoSlots: "2", inverseDepth: "2", inverseBeam: "96", inverseBudget: "3000000",
     deepRounds: "1", valuePrune: "exact", explorePairs: "4", noStop: true,
   },
+  portfolio: {
+    maxCost: "16", beam: "12000", pairs: "24000000", valueBits: "48",
+    valuePrune: "exact", explorePairs: "2", searchMode: "portfolio",
+    pslqBasis: "192", pslqPairs: "4096", egraphSeeds: "768", egraphNodes: "2048",
+    mctsIterations: "8192", mctsElegance: "0.35", noStop: true,
+  },
   genetic: {
     maxCost: "16", beam: "10000", pairs: "20000000", valueBits: "48", valuePrune: "exact", explorePairs: "2",
     searchMode: "hybrid", geneticPopulation: "4096", geneticGenerations: "64",
@@ -124,6 +140,17 @@ function geneticIntent() {
     || geneticFieldIds.some(fieldChanged);
 }
 
+function advancedIntent(name) {
+  const policy = advancedPolicies[name];
+  const value = element(policy.control).value;
+  if (value === "disabled") return false;
+  const mode = element("searchMode").value;
+  return value === "enabled"
+    || mode === name
+    || mode === "portfolio"
+    || policy.fields.some(fieldChanged);
+}
+
 function buildArguments() {
   const utility = element("utilityAction").value;
   if (utility) {
@@ -137,11 +164,17 @@ function buildArguments() {
   }
   const includeDefaults = element("includeDefaults").checked;
   const useGeneticFields = geneticIntent();
+  const advancedFields = new Map();
+  for (const [name, policy] of Object.entries(advancedPolicies)) {
+    const enabled = advancedIntent(name);
+    for (const id of policy.fields) advancedFields.set(id, enabled);
+  }
 
   for (const input of form.querySelectorAll("[data-option]")) {
     const option = input.dataset.option;
     if (!option) continue;
     if (geneticFieldIds.includes(input.id) && !useGeneticFields) continue;
+    if (advancedFields.has(input.id) && !advancedFields.get(input.id)) continue;
     if (input.id === "liveJson" && !element("live").checked && !element("liveTop").value.trim()) continue;
 
     if (input.type === "checkbox") {
@@ -159,6 +192,12 @@ function buildArguments() {
       continue;
     }
     args.push(option, value);
+  }
+
+  for (const policy of Object.values(advancedPolicies)) {
+    const value = element(policy.control).value;
+    if (value === "enabled") args.push(policy.enable);
+    else if (value === "disabled") args.push(policy.disable);
   }
 
   for (const value of lines(element("customConstants").value)) {
@@ -189,17 +228,17 @@ function validateConfiguration(args) {
   const equations = element("equations").checked;
   const genetic = geneticIntent();
   const portfolio = element("searchMode").value === "portfolio";
+  const pslq = advancedIntent("pslq");
+  const egraph = advancedIntent("egraph");
+  const mcts = advancedIntent("mcts");
   const inverseDepth = Number(element("inverseDepth").value || 0);
   const deepRounds = Number(element("deepRounds").value || 0);
   const noBidirectional = element("noBidirectional").checked;
   const maxCost = Number(element("maxCost").value);
   const sideCost = Number(element("sideCost").value || 0);
 
-  if (equations && genetic) {
-    return { valid: false, message: "方程模式暂不能与遗传模式或 genetic 调参组合。" };
-  }
-  if (equations && portfolio) {
-    return { valid: false, message: "portfolio 用于常量搜索；方程模式请选择 equation-search 的 wide 或 exhaustive。" };
+  if (equations && (genetic || portfolio || pslq || egraph || mcts)) {
+    return { valid: false, message: "方程模式不能启用遗传、PSLQ、e-graph、MCTS 或 portfolio。" };
   }
   if (equations && (inverseDepth > 0 || deepRounds > 0)) {
     return { valid: false, message: "方程模式不能启用 inverse-depth 或 deep-rounds。" };
@@ -216,8 +255,8 @@ function validateConfiguration(args) {
   if (target && argsFile) {
     return { valid: true, message: "提示：若参数文件也包含 TARGET，会产生重复目标；仅含选项则没有问题。" };
   }
-  if (genetic && !element("noStop").checked) {
-    return { valid: true, message: "建议勾选 --no-stop；否则确定性阶段提前命中 epsilon 时会跳过遗传阶段。" };
+  if ((genetic || portfolio || pslq || egraph || mcts) && !element("noStop").checked) {
+    return { valid: true, message: "建议勾选 --no-stop；否则前置搜索命中 epsilon 后会跳过后续高级阶段。" };
   }
   return { valid: true, message: `${args.length} 个参数，配置可执行。` };
 }
@@ -445,6 +484,11 @@ function importCommand() {
       ["--help", "--help"], ["-h", "--help"], ["--version", "--version"],
       ["--list-symbols", "--list-symbols"], ["--self-test", "--self-test"],
     ]);
+    const policyOptions = new Map();
+    for (const policy of Object.values(advancedPolicies)) {
+      policyOptions.set(policy.enable, { control: policy.control, value: "enabled" });
+      policyOptions.set(policy.disable, { control: policy.control, value: "disabled" });
+    }
     let targetSeen = false;
 
     for (let index = 0; index < tokens.length; index += 1) {
@@ -466,6 +510,12 @@ function importCommand() {
       if (utilities.has(option)) {
         if (inlineValue !== null) throw new Error(`${option} 不接受参数值。`);
         element("utilityAction").value = utilities.get(option);
+        continue;
+      }
+      if (policyOptions.has(option)) {
+        if (inlineValue !== null) throw new Error(`${option} 是开关，不接受参数值。`);
+        const policy = policyOptions.get(option);
+        element(policy.control).value = policy.value;
         continue;
       }
       if (option === "--constant" || option === "--symbol-count") {
@@ -884,8 +934,8 @@ function renderSearchRows(table, data) {
     || data.type === "equations"
     || data.results.some((row) => "equation" in row);
   const columns = equations
-    ? ["#", "成本", "估计根", "有符号误差", "绝对误差", "残差", "方程"]
-    : ["#", "成本", "值", "有符号误差", "绝对误差", "相对误差", "表达式"];
+    ? ["#", "成本", "方程", "估计根", "有符号误差", "绝对误差", "残差"]
+    : ["#", "成本", "表达式", "值", "有符号误差", "绝对误差", "相对误差"];
   const headRow = document.createElement("tr");
   columns.forEach((name) => {
     const cell = document.createElement("th");
@@ -897,16 +947,15 @@ function renderSearchRows(table, data) {
   const body = document.createDocumentFragment();
   data.results.forEach((row, index) => {
     const tableRow = document.createElement("tr");
-    const numericValues = equations
-      ? [index + 1, row.cost, row.estimated_root, row.signed_error, row.absolute_error, row.residual_at_target]
-      : [index + 1, row.cost, row.value, row.signed_error, row.absolute_error, row.relative_error];
-    numericValues.forEach((value, valueIndex) => {
-      tableRow.append(createCell(valueIndex >= 2 ? formatNumber(value) : String(value ?? "—")));
-    });
+    tableRow.append(createCell(String(index + 1)), createCell(String(row.cost ?? "—")));
     tableRow.append(createExpressionCell(
       equations ? row.equation : row.expression,
       row.latex,
     ));
+    const numericValues = equations
+      ? [row.estimated_root, row.signed_error, row.absolute_error, row.residual_at_target]
+      : [row.value, row.signed_error, row.absolute_error, row.relative_error];
+    numericValues.forEach((value) => tableRow.append(createCell(formatNumber(value))));
     body.append(tableRow);
   });
   table.querySelector("tbody").replaceChildren(body);
