@@ -1,0 +1,13 @@
+# Fates response file: use 1, 2, 3, 4 exactly once to make 24.
+24
+--digits 1234
+--max-literal-len 1
+--constants none
+--ops "+,-,*,/"
+--max-cost 7
+--value-bits 52
+--mode nearest
+--symbol-count 1=1
+--symbol-count 2=1
+--symbol-count 3=1
+--symbol-count 4=1

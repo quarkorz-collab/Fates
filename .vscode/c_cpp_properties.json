@@ -1,0 +1,15 @@
+{
+  "configurations": [
+    {
+      "name": "Windows MSVC C++20",
+      "includePath": [
+        "${workspaceFolder}/src",
+        "${workspaceFolder}/third_party/unordered_dense/include"
+      ],
+      "cStandard": "c17",
+      "cppStandard": "c++20",
+      "intelliSenseMode": "windows-msvc-x64"
+    }
+  ],
+  "version": 4
+}

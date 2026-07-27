@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows MSVC
+            os: windows-latest
+          - name: Linux GCC
+            os: ubuntu-latest
+          - name: macOS Clang
+            os: macos-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DFATES_ENABLE_AVX2=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run CTest
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: Run command-line regression suite
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          chmod +x tests/smoke.sh
+          tests/smoke.sh ./build/fates

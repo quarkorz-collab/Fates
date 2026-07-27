@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "profile": "release-balanced-v1",
+  "base": [
+    {
+      "name": "version startup",
+      "arguments": ["--version"]
+    },
+    {
+      "name": "self-test",
+      "arguments": ["--self-test"]
+    },
+    {
+      "name": "deterministic search",
+      "arguments": [
+        "520.82418", "--mode", "nearest", "--max-cost", "12",
+        "--beam", "1500", "--pairs", "1000000", "--no-stop", "--json"
+      ]
+    },
+    {
+      "name": "genetic search",
+      "arguments": [
+        "21", "--mode", "nearest", "--error-range", "(0,1)", "--digits=",
+        "--constants", "pi", "--ops", "+,-,*,/,^,neg,inv,sqrt,ln,sin,cos,tan,sinh",
+        "--max-cost", "12", "--beam", "1500", "--pairs", "1000000",
+        "--no-stop", "--genetic", "--genetic-population", "512",
+        "--genetic-generations", "8", "--json"
+      ]
+    },
+    {
+      "name": "equation search",
+      "arguments": [
+        "21", "--mode", "nearest", "--max-cost", "10", "--beam", "1000",
+        "--pairs", "500000", "--equations", "--equation-search", "wide",
+        "--no-stop", "--json"
+      ]
+    }
+  ],
+  "balanced_extra": [
+    {
+      "name": "portfolio search",
+      "arguments": [
+        "520.82418", "--mode", "nearest", "--max-cost", "12", "--beam", "1000",
+        "--pairs", "500000", "--search-mode", "portfolio", "--no-stop", "--json"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,251 @@
+name: Build release artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-portable:
+    name: Windows x64 portable
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DBUILD_TESTING=ON
+          -DFATES_ENABLE_AVX2=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = 'fates-windows-x64-portable'
+          $output = Join-Path $env:RUNNER_TEMP $name
+          $archive = Join-Path $env:RUNNER_TEMP "$name.zip"
+          New-Item -ItemType Directory -Path $output, (Join-Path $output 'licenses') -Force | Out-Null
+          $binaryDirectory = if (Test-Path -LiteralPath 'build\Release\fates.exe') { 'build\Release' } else { 'build' }
+          Copy-Item -LiteralPath (Join-Path $binaryDirectory 'fates.exe') -Destination $output
+          Copy-Item -LiteralPath (Join-Path $binaryDirectory 'pries.exe') -Destination $output
+          Copy-Item -LiteralPath README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $output
+          Copy-Item -LiteralPath third_party\unordered_dense\LICENSE -Destination (Join-Path $output 'licenses\unordered_dense-LICENSE')
+          Copy-Item -LiteralPath frontend\static\vendor\katex\LICENSE -Destination (Join-Path $output 'licenses\KaTeX-LICENSE')
+          @('Fates 1.0', 'toolchain=MSVC', 'pgo=false', 'avx2=false') | Set-Content -LiteralPath (Join-Path $output 'build-info.txt') -Encoding ASCII
+          $lines = Get-ChildItem -LiteralPath $output -File -Recurse | Sort-Object FullName | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            $relative = [IO.Path]::GetRelativePath($output, $_.FullName).Replace('\', '/')
+            "$hash  $relative"
+          }
+          Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Value $lines -Encoding ASCII
+          Compress-Archive -LiteralPath $output -DestinationPath $archive -CompressionLevel Optimal
+          $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          "$archiveHash  $([IO.Path]::GetFileName($archive))" | Set-Content -LiteralPath "$archive.sha256" -Encoding ASCII
+          "FATES_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fates-windows-x64-portable
+          path: |
+            ${{ env.FATES_ARCHIVE }}
+            ${{ env.FATES_ARCHIVE }}.sha256
+          compression-level: 0
+          if-no-files-found: error
+
+  windows-pgo:
+    name: Windows x64 AVX2 PGO and web
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build balanced PGO executable
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP 'fates-windows-x64-pgo-avx2'
+          .\scripts\build-pgo-windows.ps1 -OutputDirectory $output -EnableAVX2 -Training balanced
+          "FATES_OUTPUT=$output" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build web executable
+        shell: pwsh
+        run: .\frontend\build_web.ps1 -Python python -OutputDirectory $env:FATES_OUTPUT
+
+      - name: Verify and package
+        shell: pwsh
+        run: |
+          $executable = Join-Path $env:FATES_OUTPUT 'fates.exe'
+          & $executable --version
+          if ($LASTEXITCODE -ne 0) { throw 'Version check failed' }
+          & $executable --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Self-test failed' }
+          & (Join-Path $env:FATES_OUTPUT 'fates-web.exe') --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Web executable check failed' }
+          $lines = Get-ChildItem -LiteralPath $env:FATES_OUTPUT -File -Recurse | Sort-Object FullName | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            $relative = [IO.Path]::GetRelativePath($env:FATES_OUTPUT, $_.FullName).Replace('\', '/')
+            "$hash  $relative"
+          }
+          Set-Content -LiteralPath (Join-Path $env:FATES_OUTPUT 'SHA256SUMS.txt') -Value $lines -Encoding ASCII
+          $archive = Join-Path $env:RUNNER_TEMP 'fates-windows-x64-pgo-avx2.zip'
+          Compress-Archive -LiteralPath $env:FATES_OUTPUT -DestinationPath $archive -CompressionLevel Optimal
+          $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          "$archiveHash  $([IO.Path]::GetFileName($archive))" | Set-Content -LiteralPath "$archive.sha256" -Encoding ASCII
+          "FATES_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fates-windows-x64-pgo-avx2
+          path: |
+            ${{ env.FATES_ARCHIVE }}
+            ${{ env.FATES_ARCHIVE }}.sha256
+          compression-level: 0
+          if-no-files-found: error
+
+  linux-pgo:
+    name: Linux x64 AVX2 PGO
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build balanced PGO executable
+        shell: bash
+        run: |
+          output="$RUNNER_TEMP/fates-linux-x64-pgo-avx2"
+          bash scripts/build-pgo-linux.sh \
+            --output "$output" \
+            --enable-avx2 \
+            --training balanced
+          echo "FATES_OUTPUT=$output" >> "$GITHUB_ENV"
+
+      - name: Verify and package
+        shell: bash
+        run: |
+          "$FATES_OUTPUT/fates" --version
+          "$FATES_OUTPUT/fates" --self-test
+          archive="$RUNNER_TEMP/fates-linux-x64-pgo-avx2.tar.gz"
+          tar --owner=0 --group=0 --numeric-owner \
+            -C "$RUNNER_TEMP" -czf "$archive" fates-linux-x64-pgo-avx2
+          (cd "$RUNNER_TEMP" && sha256sum "$(basename "$archive")") > "$archive.sha256"
+          echo "FATES_ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fates-linux-x64-pgo-avx2
+          path: |
+            ${{ env.FATES_ARCHIVE }}
+            ${{ env.FATES_ARCHIVE }}.sha256
+          compression-level: 0
+          if-no-files-found: error
+
+  unix-portable:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64 portable
+            os: ubuntu-22.04
+            package: fates-linux-x64-portable
+          - name: macOS portable
+            os: macos-latest
+            package: fates-macos-portable
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DFATES_ENABLE_AVX2=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: Package
+        shell: bash
+        run: |
+          output="$RUNNER_TEMP/${{ matrix.package }}"
+          mkdir -p "$output/licenses"
+          cp build/fates build/pries README.md LICENSE THIRD_PARTY_NOTICES.md "$output/"
+          cp third_party/unordered_dense/LICENSE "$output/licenses/unordered_dense-LICENSE"
+          cp frontend/static/vendor/katex/LICENSE "$output/licenses/KaTeX-LICENSE"
+          printf 'Fates 1.0\ntoolchain=%s\npgo=false\navx2=false\n' "${CXX:-c++}" > "$output/build-info.txt"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$output" && find . -type f ! -name SHA256SUMS.txt -print | LC_ALL=C sort | while IFS= read -r file; do sha256sum "$file"; done > SHA256SUMS.txt)
+          else
+            (cd "$output" && find . -type f ! -name SHA256SUMS.txt -print | LC_ALL=C sort | while IFS= read -r file; do shasum -a 256 "$file"; done > SHA256SUMS.txt)
+          fi
+          archive="$RUNNER_TEMP/${{ matrix.package }}.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "${{ matrix.package }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$RUNNER_TEMP" && sha256sum "$(basename "$archive")") > "$archive.sha256"
+          else
+            (cd "$RUNNER_TEMP" && shasum -a 256 "$(basename "$archive")") > "$archive.sha256"
+          fi
+          echo "FATES_ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: |
+            ${{ env.FATES_ARCHIVE }}
+            ${{ env.FATES_ARCHIVE }}.sha256
+          compression-level: 0
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows-portable, windows-pgo, linux-pgo, unix-portable]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --generate-notes --title "Fates $GITHUB_REF_NAME"
+          fi

@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Fates · Expression Search Studio</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <header class="app-header">
+    <div class="brand-lockup">
+      <div class="brand-mark" aria-hidden="true">F</div>
+      <div>
+        <div class="brand-line">
+          <h1>Fates</h1>
+          <span class="edition">LOCAL STUDIO</span>
+        </div>
+        <p>Finding Algebraic Targets via Expression Search</p>
+      </div>
+    </div>
+    <div class="header-status">
+      <span class="status-dot" id="serverDot"></span>
+      <div>
+        <span id="serverLabel">正在连接本地服务器</span>
+        <small id="versionLabel">127.0.0.1</small>
+      </div>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="control-panel">
+      <div class="panel-heading">
+        <div>
+          <span class="eyebrow">SEARCH CONFIGURATION</span>
+          <h2>搜索配置</h2>
+        </div>
+        <button class="icon-button" id="resetButton" type="button" title="恢复默认值">↺</button>
+      </div>
+
+      <div class="preset-strip" aria-label="搜索预设">
+        <button type="button" data-preset="quick">快速</button>
+        <button type="button" data-preset="balanced">均衡</button>
+        <button type="button" data-preset="deep">深搜</button>
+        <button type="button" data-preset="genetic">遗传</button>
+        <button type="button" data-preset="equation">方程</button>
+        <button type="button" data-preset="four-pi">四 π</button>
+        <button type="button" data-preset="24-point">24 点</button>
+      </div>
+
+      <label class="filter-box">
+        <span>⌕</span>
+        <input id="optionFilter" type="search" placeholder="筛选参数名称或说明…" autocomplete="off">
+      </label>
+
+      <form id="configForm" novalidate>
+        <details class="option-group" open data-search-text="target mode result error epsilon args file utility target 目标 模式 结果 误差 参数文件 控制">
+          <summary>
+            <span><b>01</b> 目标与结果</span>
+            <small>Target &amp; output</small>
+          </summary>
+          <div class="group-body">
+            <label class="field field-wide emphasis">
+              <span>目标值 TARGET <i>必填</i></span>
+              <input id="target" type="text" inputmode="decimal" value="520.82418" placeholder="例如 520.82418">
+              <small>普通搜索的有限数值目标；控制命令或自带目标的参数文件除外。</small>
+            </label>
+            <div class="field-grid">
+              <label class="field">
+                <span>结果模式 <code>--mode</code></span>
+                <select id="mode" data-option="--mode" data-default="pareto">
+                  <option value="pareto">Pareto · 简洁/精度前沿</option>
+                  <option value="nearest">Nearest · 最近结果</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>结果数量 <code>--results</code></span>
+                <input id="results" type="number" min="1" value="20" data-option="--results" data-default="20">
+              </label>
+              <label class="field">
+                <span>误差区间 <code>--error-range</code></span>
+                <input id="errorRange" type="text" value="(-inf,inf)" data-option="--error-range" data-default="(-inf,inf)">
+                <small>约束 signed_error=value−target，如 <code>(0,1)</code>。</small>
+              </label>
+              <label class="field">
+                <span>停止误差 <code>--epsilon</code></span>
+                <input id="epsilon" type="text" inputmode="decimal" value="1e-12" data-option="--epsilon" data-default="1e-12">
+              </label>
+            </div>
+            <label class="field field-wide">
+              <span>参数文件 <code>--args-file</code></span>
+              <input id="argsFile" type="text" data-option="--args-file" data-default="" placeholder="例如 examples\24-point.args">
+              <small>UTF-8 参数文件可包含 TARGET；相对路径按 fates.exe 所在目录解释。</small>
+            </label>
+            <label class="field field-wide">
+              <span>控制动作</span>
+              <select id="utilityAction">
+                <option value="">执行搜索</option>
+                <option value="--list-symbols">列出符号 · --list-symbols</option>
+                <option value="--self-test">运行自测 · --self-test</option>
+                <option value="--version">显示版本 · --version</option>
+                <option value="--help">显示帮助 · --help</option>
+              </select>
+            </label>
+          </div>
+        </details>
+
+        <details class="option-group" open data-search-text="digits constants operator literal integer cost custom symbol count order atoms 数字 常数 运算符 次数 顺序 原子">
+          <summary>
+            <span><b>02</b> 原子、运算与约束</span>
+            <small>Atoms &amp; grammar</small>
+          </summary>
+          <div class="group-body">
+            <div class="field-grid">
+              <label class="field">
+                <span>允许数字 <code>--digits</code></span>
+                <input id="digits" type="text" value="123456789" data-option="--digits" data-default="123456789" data-empty-equals="true">
+              </label>
+              <label class="field">
+                <span>最长字面量 <code>--max-literal-len</code></span>
+                <input id="maxLiteralLen" type="number" min="0" max="18" value="2" data-option="--max-literal-len" data-default="2">
+              </label>
+              <label class="field">
+                <span>最大整数 <code>--max-integer</code></span>
+                <input id="maxInteger" type="number" min="0" value="25" data-option="--max-integer" data-default="25">
+              </label>
+              <label class="field">
+                <span>数字成本 <code>--digit-cost</code></span>
+                <input id="digitCost" type="number" min="1" max="65535" value="1" data-option="--digit-cost" data-default="1">
+              </label>
+            </div>
+            <label class="field field-wide">
+              <span>内置常数 <code>--constants</code></span>
+              <input id="constants" type="text" value="pi,e,phi" data-option="--constants" data-default="pi,e,phi" data-empty-equals="true">
+              <small>可追加成本，如 <code>pi:2</code>；写 none 禁用。下方目录由当前 fates.exe 动态提供。</small>
+            </label>
+            <div class="symbol-catalog field-wide" aria-labelledby="constantCatalogTitle">
+              <div class="catalog-heading">
+                <span id="constantCatalogTitle">全部内置常数</span>
+                <div>
+                  <button type="button" data-catalog-action="constants-all">全选</button>
+                  <button type="button" data-catalog-action="constants-none">清空</button>
+                </div>
+              </div>
+              <div class="symbol-grid" id="constantPicker"><span class="catalog-loading">正在读取符号目录…</span></div>
+            </div>
+            <label class="field field-wide">
+              <span>运算符 <code>--ops</code></span>
+              <input id="ops" type="text" value="+,-,*,/,^,neg,inv,sqrt,ln,exp" data-option="--ops" data-default="+,-,*,/,^,neg,inv,sqrt,ln,exp" data-empty-equals="true">
+              <small>可追加成本，如 <code>^:3,ln:2</code>；写 none 禁用。双曲、反双曲和 Γ 函数默认不开启。</small>
+            </label>
+            <div class="symbol-catalog field-wide" aria-labelledby="operatorCatalogTitle">
+              <div class="catalog-heading">
+                <span id="operatorCatalogTitle">全部内置运算符</span>
+                <div>
+                  <button type="button" data-catalog-action="operators-default">默认</button>
+                  <button type="button" data-catalog-action="operators-all">全选</button>
+                  <button type="button" data-catalog-action="operators-none">清空</button>
+                </div>
+              </div>
+              <div class="catalog-subheading">二元运算</div>
+              <div class="symbol-grid" id="binaryOperatorPicker"><span class="catalog-loading">正在读取符号目录…</span></div>
+              <div class="catalog-subheading">一元运算</div>
+              <div class="symbol-grid" id="unaryOperatorPicker"></div>
+            </div>
+            <label class="field field-wide">
+              <span>自定义常数 <code>--constant</code> · 每行一项</span>
+              <textarea id="customConstants" rows="3" placeholder="G=0.915965594177219:2"></textarea>
+            </label>
+            <label class="field field-wide">
+              <span>符号次数 <code>--symbol-count</code> · 每行一项</span>
+              <textarea id="symbolCounts" rows="3" placeholder="pi=2:4&#10;e=0"></textarea>
+            </label>
+            <label class="field field-wide">
+              <span>叶子顺序 <code>--symbol-order</code></span>
+              <input id="symbolOrder" type="text" data-option="--symbol-order" data-default="" placeholder="1,1,4,5,1,4">
+            </label>
+          </div>
+        </details>
+
+        <details class="option-group" open data-search-text="cost beam pairs threads chunks bits value prune exact bucket explore sampling atoms bidirectional stop performance search budget 成本 候选 预算 线程 性能 双向 数值剪枝 探索采样">
+          <summary>
+            <span><b>03</b> 搜索规模与性能</span>
+            <small>Core budgets</small>
+          </summary>
+          <div class="group-body">
+            <div class="field-grid three-columns">
+              <label class="field">
+                <span>最大成本 <code>--max-cost</code></span>
+                <input id="maxCost" type="number" min="1" max="65535" value="10" data-option="--max-cost" data-default="10">
+              </label>
+              <label class="field">
+                <span>单边成本 <code>--side-cost</code></span>
+                <input id="sideCost" type="number" min="0" value="0" data-option="--side-cost" data-default="0">
+              </label>
+              <label class="field">
+                <span>Beam <code>--beam</code></span>
+                <input id="beam" type="number" min="1" value="3000" data-option="--beam" data-default="3000">
+              </label>
+              <label class="field">
+                <span>组合预算 <code>--pairs</code></span>
+                <input id="pairs" type="number" min="1" value="4000000" data-option="--pairs" data-default="4000000">
+              </label>
+              <label class="field">
+                <span>线程 <code>--threads</code></span>
+                <input id="threads" type="number" min="0" value="0" data-option="--threads" data-default="0">
+              </label>
+              <label class="field">
+                <span>任务块 <code>--task-chunks</code></span>
+                <input id="taskChunks" type="number" min="1" value="64" data-option="--task-chunks" data-default="64">
+              </label>
+              <label class="field">
+                <span>数值位 <code>--value-bits</code></span>
+                <input id="valueBits" type="number" min="0" max="52" value="42" data-option="--value-bits" data-default="42">
+              </label>
+              <label class="field">
+                <span>数值剪枝 <code>--value-prune</code></span>
+                <select id="valuePrune" data-option="--value-prune" data-default="bucket">
+                  <option value="bucket">bucket · 快速近似分桶</option>
+                  <option value="exact">exact · 仅严格相等值</option>
+                </select>
+                <small>exact 会保留同桶内的近似候选，只去除严格相同 double 状态。</small>
+              </label>
+              <label class="field">
+                <span>探索采样 <code>--explore-pairs</code></span>
+                <input id="explorePairs" type="number" min="0" value="0" data-option="--explore-pairs" data-default="0">
+                <small>每个非完整外层额外确定性抽样；0 关闭。</small>
+              </label>
+              <label class="field">
+                <span>原子上限 <code>--max-atoms</code></span>
+                <input id="maxAtoms" type="number" min="0" value="200000" data-option="--max-atoms" data-default="200000">
+              </label>
+            </div>
+            <div class="toggle-grid">
+              <label class="toggle">
+                <input id="noStop" type="checkbox" data-option="--no-stop">
+                <span></span>
+                <div><b>达到 epsilon 后继续</b><small><code>--no-stop</code></small></div>
+              </label>
+              <label class="toggle">
+                <input id="noBidirectional" type="checkbox" data-option="--no-bidirectional">
+                <span></span>
+                <div><b>完整逐层搜索</b><small><code>--no-bidirectional</code></small></div>
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="option-group" data-search-text="pareto inverse deep neighbors depth max abs exponent trig advanced 逆向 深层 指数 三角 前沿">
+          <summary>
+            <span><b>04</b> 逆向与深层扩展</span>
+            <small>Advanced recall</small>
+          </summary>
+          <div class="group-body">
+            <div class="field-grid three-columns">
+              <label class="field">
+                <span>Pareto 槽 <code>--pareto-slots</code></span>
+                <input id="paretoSlots" type="number" min="1" max="4" value="1" data-option="--pareto-slots" data-default="1">
+              </label>
+              <label class="field">
+                <span>侧车上限 <code>--pareto-extra</code></span>
+                <input id="paretoExtra" type="number" min="0" value="0" data-option="--pareto-extra" data-default="0">
+              </label>
+              <label class="field">
+                <span>逆值近邻 <code>--inverse-neighbors</code></span>
+                <input id="inverseNeighbors" type="number" min="1" max="256" value="5" data-option="--inverse-neighbors" data-default="5">
+              </label>
+              <label class="field">
+                <span>逆模板深度 <code>--inverse-depth</code></span>
+                <input id="inverseDepth" type="number" min="0" max="8" value="0" data-option="--inverse-depth" data-default="0">
+              </label>
+              <label class="field">
+                <span>逆模板 Beam <code>--inverse-beam</code></span>
+                <input id="inverseBeam" type="number" min="1" value="64" data-option="--inverse-beam" data-default="64">
+              </label>
+              <label class="field">
+                <span>逆模板预算 <code>--inverse-budget</code></span>
+                <input id="inverseBudget" type="number" min="0" value="1000000" data-option="--inverse-budget" data-default="1000000">
+              </label>
+              <label class="field">
+                <span>深层轮数 <code>--deep-rounds</code></span>
+                <input id="deepRounds" type="number" min="0" value="0" data-option="--deep-rounds" data-default="0">
+              </label>
+              <label class="field">
+                <span>深层 Beam <code>--deep-beam</code></span>
+                <input id="deepBeam" type="number" min="0" value="0" data-option="--deep-beam" data-default="0">
+              </label>
+              <label class="field">
+                <span>深层输入前沿 <code>--deep-frontier</code></span>
+                <input id="deepFrontier" type="number" min="0" value="0" data-option="--deep-frontier" data-default="0">
+                <small>0 表示不限；portfolio 会在未显式指定时自动采用高效上限。</small>
+              </label>
+              <label class="field">
+                <span>中间值上限 <code>--max-abs</code></span>
+                <input id="maxAbs" type="text" value="1e100" data-option="--max-abs" data-default="1e100">
+              </label>
+              <label class="field">
+                <span>指数上限 <code>--max-exponent</code></span>
+                <input id="maxExponent" type="text" value="32" data-option="--max-exponent" data-default="32">
+              </label>
+              <label class="field">
+                <span>三角参数上限 <code>--max-trig-arg</code></span>
+                <input id="maxTrigArg" type="text" value="1e6" data-option="--max-trig-arg" data-default="1e6">
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="option-group" data-search-text="equation genetic hybrid population generation seed elegance repair stable wide exhaustive strict local 方程 遗传 稳定 宽搜 穷举 严格">
+          <summary>
+            <span><b>05</b> 方程与遗传模式</span>
+            <small>Alternative modes</small>
+          </summary>
+          <div class="group-body">
+            <div class="toggle-grid">
+              <label class="toggle">
+                <input id="equations" type="checkbox" data-option="--equations">
+                <span></span>
+                <div><b>方程逼近</b><small><code>--equations</code> · 自动引入 x</small></div>
+              </label>
+              <label class="toggle">
+                <input id="genetic" type="checkbox" data-option="--genetic">
+                <span></span>
+                <div><b>遗传混合阶段</b><small><code>--genetic</code></small></div>
+              </label>
+            </div>
+            <div class="field-grid three-columns">
+              <label class="field">
+                <span>方程近邻 <code>--equation-neighbors</code></span>
+                <input id="equationNeighbors" type="number" min="1" value="64" data-option="--equation-neighbors" data-default="64">
+              </label>
+              <label class="field">
+                <span>方程搜索 <code>--equation-search</code></span>
+                <select id="equationSearch" data-option="--equation-search" data-default="stable">
+                  <option value="stable">stable（默认）</option>
+                  <option value="wide">wide（扩大采样）</option>
+                  <option value="exhaustive">exhaustive（预算内穷举）</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>方程质量 <code>--equation-quality</code></span>
+                <select id="equationQuality" data-option="--equation-quality" data-default="strict">
+                  <option value="strict">strict（稳定根）</option>
+                  <option value="local">local（只检局部）</option>
+                  <option value="off">off（兼容旧行为）</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>搜索模式 <code>--search-mode</code></span>
+                <select id="searchMode" data-option="--search-mode" data-default="deterministic">
+                  <option value="deterministic">deterministic</option>
+                  <option value="hybrid">hybrid</option>
+                  <option value="genetic">genetic</option>
+                  <option value="portfolio">portfolio</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>种群 <code>--genetic-population</code></span>
+                <input id="geneticPopulation" type="number" min="1" value="4096" data-option="--genetic-population" data-default="4096">
+              </label>
+              <label class="field">
+                <span>代数 <code>--genetic-generations</code></span>
+                <input id="geneticGenerations" type="number" min="1" value="64" data-option="--genetic-generations" data-default="64">
+              </label>
+              <label class="field">
+                <span>随机种子 <code>--genetic-seed</code></span>
+                <input id="geneticSeed" type="text" value="2611923443488327891" data-option="--genetic-seed" data-default="2611923443488327891">
+              </label>
+              <label class="field">
+                <span>简洁惩罚 <code>--genetic-elegance</code></span>
+                <input id="geneticElegance" type="number" min="0" step="0.05" value="0.35" data-option="--genetic-elegance" data-default="0.35">
+              </label>
+              <label class="field">
+                <span>修复概率 <code>--genetic-repair</code></span>
+                <input id="geneticRepair" type="number" min="0" max="1" step="0.05" value="0.15" data-option="--genetic-repair" data-default="0.15">
+              </label>
+              <label class="field">
+                <span>修复深度 <code>--genetic-repair-depth</code></span>
+                <input id="geneticRepairDepth" type="number" min="1" max="8" value="3" data-option="--genetic-repair-depth" data-default="3">
+              </label>
+              <label class="field">
+                <span>子树交叉 <code>--genetic-crossover</code></span>
+                <input id="geneticCrossover" type="number" min="0" max="1" step="0.05" value="0.25" data-option="--genetic-crossover" data-default="0.25">
+              </label>
+              <label class="field">
+                <span>结构新颖度 <code>--genetic-novelty</code></span>
+                <input id="geneticNovelty" type="number" min="0" max="0.5" step="0.05" value="0.2" data-option="--genetic-novelty" data-default="0.2">
+              </label>
+              <label class="field">
+                <span>锦标赛规模 <code>--genetic-tournament</code></span>
+                <input id="geneticTournament" type="number" min="1" max="64" value="4" data-option="--genetic-tournament" data-default="4">
+              </label>
+            </div>
+            <div class="mode-note" id="modeNote">
+              遗传模式会先运行确定性搜索，再以完整合法 AST 档案做近邻修复、子树交叉和结构物种保留；不会注入任意浮点常数。与 portfolio 同开时会自动错开重复的多样性档案。
+            </div>
+          </div>
+        </details>
+
+        <details class="option-group" data-search-text="live json dry run verbose stats output real time 实时 输出 JSON 统计">
+          <summary>
+            <span><b>06</b> 实时与诊断输出</span>
+            <small>Live &amp; diagnostics</small>
+          </summary>
+          <div class="group-body">
+            <div class="toggle-grid">
+              <label class="toggle">
+                <input id="live" type="checkbox" data-option="--live">
+                <span></span>
+                <div><b>实时结果</b><small><code>--live</code></small></div>
+              </label>
+              <label class="toggle">
+                <input id="jsonOutput" type="checkbox" checked data-option="--json">
+                <span></span>
+                <div><b>结构化结果</b><small><code>--json</code> · 推荐用于网页表格</small></div>
+              </label>
+              <label class="toggle">
+                <input id="liveJson" type="checkbox" checked data-option="--live-json">
+                <span></span>
+                <div><b>结构化实时事件</b><small><code>--live-json</code> · 网页推荐</small></div>
+              </label>
+              <label class="toggle">
+                <input id="latexOutput" type="checkbox" data-option="--latex">
+                <span></span>
+                <div><b>CUI 输出 LaTeX 源码</b><small><code>--latex</code> · 不影响网页切换</small></div>
+              </label>
+              <label class="toggle">
+                <input id="dryRun" type="checkbox" data-option="--dry-run">
+                <span></span>
+                <div><b>只验证配置</b><small><code>--dry-run</code></small></div>
+              </label>
+              <label class="toggle">
+                <input id="verbose" type="checkbox" data-option="--verbose">
+                <span></span>
+                <div><b>逐层统计</b><small><code>--verbose</code></small></div>
+              </label>
+              <label class="toggle">
+                <input id="noStats" type="checkbox" data-option="--no-stats">
+                <span></span>
+                <div><b>隐藏最终统计</b><small><code>--no-stats</code></small></div>
+              </label>
+            </div>
+            <div class="field-grid three-columns">
+              <label class="field">
+                <span>实时 Top N <code>--live-top</code></span>
+                <input id="liveTop" type="number" min="1" data-option="--live-top" data-default="" placeholder="留空则取 results">
+              </label>
+              <label class="field">
+                <span>刷新秒数 <code>--live-interval</code></span>
+                <input id="liveInterval" type="number" min="0" step="0.1" value="2" data-option="--live-interval" data-default="2">
+              </label>
+            </div>
+            <label class="toggle standalone-toggle">
+              <input id="includeDefaults" type="checkbox">
+              <span></span>
+              <div><b>命令中写出全部默认参数</b><small>通常关闭，命令更简洁</small></div>
+            </label>
+          </div>
+        </details>
+      </form>
+    </aside>
+
+    <section class="result-panel">
+      <div class="hero-card">
+        <div class="hero-copy">
+          <span class="eyebrow">EXPRESSION SEARCH</span>
+          <h2>让数值找到优雅的表达式。</h2>
+          <p>确定性双向搜索、递归逆模板、深层组合与可复现遗传探索，共享同一套成本和合法性规则。</p>
+        </div>
+        <div class="hero-orbit" aria-hidden="true">
+          <span>π</span><span>e</span><span>√</span><span>φ</span>
+          <b>≈</b>
+        </div>
+      </div>
+
+      <div class="command-card">
+        <div class="command-title">
+          <div>
+            <span class="eyebrow">EDITABLE COMMAND</span>
+            <h3>命令行配置</h3>
+          </div>
+          <div class="command-actions">
+            <button id="importCommand" type="button" class="quiet-button accent-button">导入到表单</button>
+            <button id="copyCommand" type="button" class="quiet-button">复制命令</button>
+          </div>
+        </div>
+        <textarea id="commandPreview" rows="3" spellcheck="false" aria-label="可编辑的 Fates PowerShell 命令">.\fates.exe 520.82418 --json</textarea>
+        <div class="command-hint">可粘贴或直接修改 PowerShell 风格命令，再点“导入到表单”。支持引号、<code>--name=value</code>、重复常数和符号次数。</div>
+        <div class="validation-message" id="validationMessage" aria-live="polite"></div>
+        <div class="action-row">
+          <button id="runButton" type="button" class="primary-button">
+            <span class="play-icon">▶</span>
+            开始搜索
+          </button>
+          <button id="cancelButton" type="button" class="danger-button" disabled>停止</button>
+          <div class="run-state">
+            <span class="run-dot idle" id="runDot"></span>
+            <div><b id="runStatus">等待配置</b><small id="runMetrics">尚未运行</small></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="output-card">
+        <div class="output-toolbar">
+          <div class="tabs" role="tablist">
+            <button class="tab active" type="button" data-tab="results">结果</button>
+            <button class="tab" type="button" data-tab="live-output">实时</button>
+            <button class="tab" type="button" data-tab="raw-output">原始输出</button>
+          </div>
+          <div class="output-tools">
+            <div class="render-switch" id="renderSwitch" role="group" aria-label="表达式显示方式">
+              <button class="active" type="button" data-render-mode="latex">LaTeX</button>
+              <button type="button" data-render-mode="text">纯文本</button>
+            </div>
+            <span id="resultSummary">未运行</span>
+          </div>
+        </div>
+
+        <div class="tab-pane active" id="resultsPane" data-pane="results">
+          <div class="empty-state" id="emptyState">
+            <div class="empty-symbol">ƒ</div>
+            <h3>准备探索表达式空间</h3>
+            <p>选择预设或调整左侧参数，然后开始搜索。</p>
+          </div>
+          <div class="table-wrap hidden" id="resultTableWrap">
+            <table id="resultTable">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <pre class="fallback-output hidden" id="fallbackOutput"></pre>
+        </div>
+
+        <div class="tab-pane" id="livePane" data-pane="live-output">
+          <div class="live-heading">
+            <div><span class="eyebrow">LIVE FRONTIER</span><b id="liveTitle">等待实时结果</b></div>
+            <small id="liveMeta">启用 --live 或 --live-top 后显示当前 top N</small>
+          </div>
+          <div class="live-empty" id="liveEmpty">搜索开始后，当前最优候选会在这里平滑更新。</div>
+          <div class="table-wrap hidden" id="liveTableWrap">
+            <table id="liveResultTable">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <pre class="hidden" id="liveOutput"></pre>
+        </div>
+
+        <div class="tab-pane" id="rawPane" data-pane="raw-output">
+          <div class="stream-label">STDOUT</div>
+          <pre id="stdoutOutput">尚无输出。</pre>
+          <div class="stream-label stderr-label">STDERR / LIVE</div>
+          <pre id="stderrOutput">尚无输出。</pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>Fates Local Studio</span>
+    <span>仅监听本机回环地址 · 命令不经过 shell · 搜索由本地 fates.exe 执行</span>
+  </footer>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="/vendor/katex/katex.min.js" defer></script>
+  <script src="/app.js" defer></script>
+</body>
+</html>
