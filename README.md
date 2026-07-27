@@ -79,37 +79,6 @@ bash scripts/build-pgo-linux.sh --enable-avx2 --training balanced
 
 PGO 配置文件与生成它的源码、编译器版本和编译选项绑定，不能可靠地跨版本复用，因此脚本每次都从当前源码重新训练。
 
-### VS Code
-
-请用 **File > Open Folder** 打开整个项目目录，使仓库内的 `.vscode` C++20 配置生效；仅单独打开 `src/fates.cpp` 时，VS Code 不会读取该配置。若仍看到 `std::set::contains`、`std::bit_cast`、`std::rotl`、`std::countl_zero` 或 `std::numbers` 不存在等提示，请在命令面板依次运行 `C/C++: Reset IntelliSense Database` 和 `Developer: Reload Window`。这些提示通常来自扩展沿用旧的 C++17 数据库，不是编译错误。若 C/C++ 扩展的中文诊断本身乱码，可临时通过 `Configure Display Language` 切换到 English；这只改变编辑器诊断语言，不影响源码编码或程序输出。
-
-### GitHub Actions
-
-仓库包含两个工作流：
-
-- `CI`：每次 push 和 pull request 在 Windows、Linux、macOS 上构建并运行测试；
-- `Build release artifacts`：可在 GitHub 的 Actions 页面手动点击 **Run workflow**，也会在推送 `v*` 标签时运行。
-
-发布构建会生成五个可下载 artifact，每个 artifact 内含可直接上传 Releases 的归档和归档 SHA-256：
-
-```text
-fates-windows-x64-portable.zip
-fates-windows-x64-pgo-avx2.zip
-fates-linux-x64-portable.tar.gz
-fates-linux-x64-pgo-avx2.tar.gz
-fates-macos-portable.tar.gz
-```
-
-PGO Windows 包同时包含 `fates-web.exe`。每个包包含许可证、第三方声明、构建信息和 SHA-256 校验文件，不需要配置仓库 secret。Linux 发布任务固定使用 Ubuntu 22.04，以避免 `ubuntu-latest` 漂移到更新 glibc 后降低二进制兼容性；本地脚本则会链接当前系统的 glibc。推送 `v*` 标签时，工作流会在所有包验证成功后自动创建对应 GitHub Release；手动运行工作流时只生成 Actions artifacts。
-
-项目默认使用 `third_party/unordered_dense`。如需使用标准库容器：
-
-```bash
-cmake -S . -B build-std -DCMAKE_BUILD_TYPE=Release \
-  -DFATES_USE_STD_CONTAINERS=ON
-cmake --build build-std --config Release --parallel
-```
-
 ## 快速开始
 
 使用 `sqrt` 构造 `sqrt(2)`：
