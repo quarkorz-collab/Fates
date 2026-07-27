@@ -44,12 +44,16 @@ jobs:
           Copy-Item -LiteralPath third_party\unordered_dense\LICENSE -Destination (Join-Path $output 'licenses\unordered_dense-LICENSE')
           Copy-Item -LiteralPath frontend\static\vendor\katex\LICENSE -Destination (Join-Path $output 'licenses\KaTeX-LICENSE')
           @('Fates 1.0', 'toolchain=MSVC', 'pgo=false', 'avx2=false') | Set-Content -LiteralPath (Join-Path $output 'build-info.txt') -Encoding ASCII
-          $lines = Get-ChildItem -LiteralPath $output -File -Recurse | Sort-Object FullName | ForEach-Object {
+          $checksumPath = Join-Path $output 'SHA256SUMS.txt'
+          $lines = Get-ChildItem -LiteralPath $output -File -Recurse |
+            Where-Object { $_.FullName -ne $checksumPath } |
+            Sort-Object FullName |
+            ForEach-Object {
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
             $relative = [IO.Path]::GetRelativePath($output, $_.FullName).Replace('\', '/')
             "$hash  $relative"
           }
-          Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Value $lines -Encoding ASCII
+          Set-Content -LiteralPath $checksumPath -Value $lines -Encoding ASCII
           Compress-Archive -LiteralPath $output -DestinationPath $archive -CompressionLevel Optimal
           $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
           "$archiveHash  $([IO.Path]::GetFileName($archive))" | Set-Content -LiteralPath "$archive.sha256" -Encoding ASCII
@@ -99,12 +103,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Self-test failed' }
           & (Join-Path $env:FATES_OUTPUT 'fates-web.exe') --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'Web executable check failed' }
-          $lines = Get-ChildItem -LiteralPath $env:FATES_OUTPUT -File -Recurse | Sort-Object FullName | ForEach-Object {
+          $checksumPath = Join-Path $env:FATES_OUTPUT 'SHA256SUMS.txt'
+          $lines = Get-ChildItem -LiteralPath $env:FATES_OUTPUT -File -Recurse |
+            Where-Object { $_.FullName -ne $checksumPath } |
+            Sort-Object FullName |
+            ForEach-Object {
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
             $relative = [IO.Path]::GetRelativePath($env:FATES_OUTPUT, $_.FullName).Replace('\', '/')
             "$hash  $relative"
           }
-          Set-Content -LiteralPath (Join-Path $env:FATES_OUTPUT 'SHA256SUMS.txt') -Value $lines -Encoding ASCII
+          Set-Content -LiteralPath $checksumPath -Value $lines -Encoding ASCII
           $archive = Join-Path $env:RUNNER_TEMP 'fates-windows-x64-pgo-avx2.zip'
           Compress-Archive -LiteralPath $env:FATES_OUTPUT -DestinationPath $archive -CompressionLevel Optimal
           $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
@@ -242,6 +250,7 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
