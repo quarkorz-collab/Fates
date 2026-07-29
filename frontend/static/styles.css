@@ -220,6 +220,10 @@ pre {
   padding: 24px clamp(16px, 2.4vw, 40px) 40px;
 }
 
+.workspace > * {
+  min-width: 0;
+}
+
 .control-panel,
 .hero-card,
 .command-card,
@@ -1421,6 +1425,18 @@ footer {
   .three-columns,
   .toggle-grid {
     grid-template-columns: 1fr;
+  }
+
+  .field > span {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .field > span code {
+    max-width: 100%;
+    margin-left: auto;
+    overflow-wrap: anywhere;
+    text-align: right;
   }
 
   .symbol-grid {

@@ -217,6 +217,7 @@ MCTS 使用渐进拓宽和 UCT，在目标反推近邻中扩展表达式。奖�
 --mode pareto       按复杂度和误差输出前沿
 --mode nearest      按误差输出结果（默认）
 --results N         输出 N 条结果
+--result-value-bits N  结果数值去重精度（默认 48；52 仅合并严格相同值）
 --json              输出 JSON
 --latex             在普通输出中显示 LaTeX
 --live              持续输出当前结果
@@ -262,6 +263,7 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 | `--task-chunks N` | 每个组合分区的任务块数 | `64` |
 | `--value-bits N` | 数值分桶保留的尾数位 | `42` |
 | `--value-prune MODE` | `bucket` 或 `exact` | `bucket` |
+| `--result-value-bits N` | 最终与实时结果去重尾数位；`52` 仅合并严格相同值 | `48` |
 | `--side-cost N` | 双向搜索的单边成本；`0` 自动选择 | 自动 |
 | `--no-bidirectional` | 使用完整逐层搜索 | 关闭 |
 | `--deep-rounds N` | 深层组合轮数 | `0` |
@@ -354,6 +356,7 @@ GitHub Actions 使用相同的 CMake/CTest 入口，Linux 任务还会执行完�
 - 阶乘只接受接近非负整数且不大于 170 的输入；
 - 方程结果取决于初值、迭代次数和局部收敛情况；
 - 增大 `--beam`、`--pairs` 或 `--value-bits` 会增加内存和计算时间。
+- `--result-value-bits` 只影响最终和实时结果的近等值去重，不改变搜索空间；同桶优先保留成本、节点数和深度更小的表达式。
 
 ## 目录
 
@@ -390,6 +393,7 @@ Fates/
 │   ├── pgo-workloads.json
 │   └── run-pgo-training.py
 ├── third_party/
+│   ├── pdqsort/
 │   └── unordered_dense/
 └── tests/
     ├── benchmark_containers.ps1
@@ -398,4 +402,4 @@ Fates/
 
 ## 许可证
 
-Fates 本体使用 MIT 许可证。`ankerl::unordered_dense` 和网页端 KaTeX 也使用 MIT 许可证，许可证文本保存在各自目录中；汇总信息见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+Fates 本体使用 MIT 许可证。`ankerl::unordered_dense` 和网页端 KaTeX 使用 MIT 许可证，`pdqsort` 使用 zlib 许可证；许可证文本保存在各自目录中，汇总信息见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。

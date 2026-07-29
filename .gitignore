@@ -10,6 +10,7 @@
 /.profile-*/
 /.cache/
 /artifacts/
+/.playwright-mcp/
 /out/
 /.cmake-*/
 /.venv/

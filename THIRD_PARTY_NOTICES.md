@@ -9,6 +9,13 @@ Fates includes the following source and browser assets.
 - License: MIT
 - Local license: `third_party/unordered_dense/LICENSE`
 
+## pdqsort
+
+- Revision: `b1ef26a55cdb60d236a5cb199c4234c704f46726`
+- Upstream: https://github.com/orlp/pdqsort
+- License: zlib
+- Local license: `third_party/pdqsort/LICENSE`
+
 ## KaTeX
 
 - Version: 0.18.1

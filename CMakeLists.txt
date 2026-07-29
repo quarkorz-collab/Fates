@@ -9,6 +9,8 @@ option(FATES_ENABLE_AVX2 "Require AVX2 and enable AVX2 code generation" OFF)
 
 add_executable(fates src/fates.cpp)
 target_compile_features(fates PRIVATE cxx_std_20)
+target_include_directories(fates SYSTEM PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pdqsort")
 find_package(Threads REQUIRED)
 target_link_libraries(fates PRIVATE Threads::Threads)
 

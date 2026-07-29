@@ -123,7 +123,8 @@ try {
 
     $compileArguments = @(
         '/nologo', '/c', '/std:c++20', '/O2', '/Ob3', '/GL', '/Gw', '/Gy',
-        '/fp:precise', '/W4', '/utf-8', '/EHsc', '/MT', '/DNDEBUG'
+        '/fp:precise', '/W4', '/utf-8', '/EHsc', '/MT', '/DNDEBUG',
+        "/external:I$(Join-Path $projectDirectory 'third_party\pdqsort')", '/external:W0'
     )
     if ($EnableAVX2) {
         $compileArguments += '/arch:AVX2'
@@ -190,6 +191,8 @@ try {
     New-Item -ItemType Directory -Path $licenseDirectory -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $projectDirectory 'third_party\unordered_dense\LICENSE') `
         -Destination (Join-Path $licenseDirectory 'unordered_dense-LICENSE') -Force
+    Copy-Item -LiteralPath (Join-Path $projectDirectory 'third_party\pdqsort\LICENSE') `
+        -Destination (Join-Path $licenseDirectory 'pdqsort-LICENSE') -Force
     Copy-Item -LiteralPath (Join-Path $projectDirectory 'frontend\static\vendor\katex\LICENSE') `
         -Destination (Join-Path $licenseDirectory 'KaTeX-LICENSE') -Force
 

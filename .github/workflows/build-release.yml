@@ -42,6 +42,7 @@ jobs:
           Copy-Item -LiteralPath (Join-Path $binaryDirectory 'pries.exe') -Destination $output
           Copy-Item -LiteralPath README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $output
           Copy-Item -LiteralPath third_party\unordered_dense\LICENSE -Destination (Join-Path $output 'licenses\unordered_dense-LICENSE')
+          Copy-Item -LiteralPath third_party\pdqsort\LICENSE -Destination (Join-Path $output 'licenses\pdqsort-LICENSE')
           Copy-Item -LiteralPath frontend\static\vendor\katex\LICENSE -Destination (Join-Path $output 'licenses\KaTeX-LICENSE')
           @('Fates 1.0', 'toolchain=MSVC', 'pgo=false', 'avx2=false') | Set-Content -LiteralPath (Join-Path $output 'build-info.txt') -Encoding ASCII
           $checksumPath = Join-Path $output 'SHA256SUMS.txt'
@@ -207,6 +208,7 @@ jobs:
           mkdir -p "$output/licenses"
           cp build/fates build/pries README.md LICENSE THIRD_PARTY_NOTICES.md "$output/"
           cp third_party/unordered_dense/LICENSE "$output/licenses/unordered_dense-LICENSE"
+          cp third_party/pdqsort/LICENSE "$output/licenses/pdqsort-LICENSE"
           cp frontend/static/vendor/katex/LICENSE "$output/licenses/KaTeX-LICENSE"
           printf 'Fates 1.0\ntoolchain=%s\npgo=false\navx2=false\n' "${CXX:-c++}" > "$output/build-info.txt"
           if command -v sha256sum >/dev/null 2>&1; then

@@ -96,6 +96,7 @@ mkdir -p -- "$profile_dir" "$output_dir/licenses"
 
 common_flags=(
   -O3 -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic -flto -pthread
+  -isystem "$project_dir/third_party/pdqsort"
 )
 arch_flags=()
 if ((enable_avx2)); then
@@ -137,6 +138,8 @@ cp -- "$project_dir/README.md" "$project_dir/LICENSE" \
   "$project_dir/THIRD_PARTY_NOTICES.md" "$output_dir/"
 cp -- "$project_dir/third_party/unordered_dense/LICENSE" \
   "$output_dir/licenses/unordered_dense-LICENSE"
+cp -- "$project_dir/third_party/pdqsort/LICENSE" \
+  "$output_dir/licenses/pdqsort-LICENSE"
 cp -- "$project_dir/frontend/static/vendor/katex/LICENSE" \
   "$output_dir/licenses/KaTeX-LICENSE"
 

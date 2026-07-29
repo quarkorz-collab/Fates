@@ -60,7 +60,7 @@
       </label>
 
       <form id="configForm" novalidate>
-        <details class="option-group" open data-search-text="target mode result error epsilon args file utility target 目标 模式 结果 误差 参数文件 控制">
+        <details class="option-group" open data-search-text="target mode result deduplicate bits error epsilon args file utility target 目标 模式 结果 去重 精度 误差 参数文件 控制">
           <summary>
             <span><b>01</b> 目标与结果</span>
             <small>Target &amp; output</small>
@@ -82,6 +82,11 @@
               <label class="field">
                 <span>结果数量 <code>--results</code></span>
                 <input id="results" type="number" min="1" value="20" data-option="--results" data-default="20">
+              </label>
+              <label class="field">
+                <span>结果去重位 <code>--result-value-bits</code></span>
+                <input id="resultValueBits" type="number" min="0" max="52" value="48" data-option="--result-value-bits" data-default="48">
+                <small>48 合并极近数值并保留更简洁式；52 仅合并严格相同的 double 值。</small>
               </label>
               <label class="field">
                 <span>误差区间 <code>--error-range</code></span>

@@ -34,6 +34,7 @@
 #include "fast_containers.h"
 #include "extension_api.h"
 #include "user_extensions.h"
+#include <pdqsort.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -447,6 +448,7 @@ struct Config {
     std::size_t task_chunks = 64;
     unsigned threads = std::max(1U, std::thread::hardware_concurrency());
     unsigned value_bits = 42;
+    unsigned result_value_bits = 48;
     ValuePruneMode value_prune = ValuePruneMode::Bucket;
     std::size_t explore_pairs = 0;
     unsigned pareto_slots = 1;
@@ -525,8 +527,24 @@ static std::uint64_t value_bucket(double value, unsigned mantissa_bits) {
     const unsigned keep = std::min(52U, mantissa_bits);
     const unsigned drop = 52U - keep;
     if (drop > 0) {
-        const std::uint64_t low_mask = (drop == 64U) ? ~0ULL : ((1ULL << drop) - 1ULL);
+        const std::uint64_t low_mask = (1ULL << drop) - 1ULL;
         bits &= ~low_mask;
+    }
+    return bits;
+}
+
+static std::uint64_t rounded_value_bucket(double value, unsigned mantissa_bits) {
+    if (value == 0.0) return 0;
+    std::uint64_t bits = std::bit_cast<std::uint64_t>(value);
+    const unsigned keep = std::min(52U, mantissa_bits);
+    const unsigned drop = 52U - keep;
+    if (drop > 0) {
+        constexpr std::uint64_t sign_mask = 1ULL << 63U;
+        const std::uint64_t low_mask = (1ULL << drop) - 1ULL;
+        std::uint64_t magnitude = bits & ~sign_mask;
+        magnitude += 1ULL << (drop - 1U);
+        magnitude &= ~low_mask;
+        bits = (bits & sign_mask) | magnitude;
     }
     return bits;
 }
@@ -757,10 +775,8 @@ public:
     }
 
     void consider_with_key(const Candidate& candidate, std::uint64_t key) {
-        const auto it = table_.find(key);
-        if (it == table_.end()) {
-            table_.emplace(key, candidate);
-        } else {
+        const auto [it, inserted] = table_.try_emplace(key, candidate);
+        if (!inserted) {
             if (better(candidate, it->second)) {
                 const Candidate displaced = it->second;
                 it->second = candidate;
@@ -825,7 +841,7 @@ private:
             return;
         }
 #endif
-        std::sort(begin, end, compare);
+        pdqsort(begin, end, compare);
     }
 
     bool better(const Candidate& a, const Candidate& b) const {
@@ -858,10 +874,8 @@ private:
             extra_reserved_ = true;
         }
         const std::uint64_t key = extra_key(candidate, state_key);
-        const auto it = extra_table_.find(key);
-        if (it == extra_table_.end()) {
-            extra_table_.emplace(key, candidate);
-        } else if (more_elegant(candidate, it->second)) {
+        const auto [it, inserted] = extra_table_.try_emplace(key, candidate);
+        if (!inserted && more_elegant(candidate, it->second)) {
             it->second = candidate;
         }
         if (extra_table_.size() > extra_cap_ * 2) prune_extras_to(extra_cap_);
@@ -874,11 +888,11 @@ private:
         std::vector<Candidate> all;
         all.reserve(extra_table_.size());
         for (const auto& [_, candidate] : extra_table_) all.push_back(candidate);
-        sort_range(all.begin(), all.end(), [&](const Candidate& a, const Candidate& b) {
+        const double scale = std::max(1.0, std::abs(target_));
+        const double precision_floor = std::ldexp(scale, -static_cast<int>(value_bits_));
+        const auto elegance_order = [&](const Candidate& a, const Candidate& b) {
             const double ea = abs_error(a.value, target_);
             const double eb = abs_error(b.value, target_);
-            const double scale = std::max(1.0, std::abs(target_));
-            const double precision_floor = std::ldexp(scale, -static_cast<int>(value_bits_));
             const bool a_equivalent = ea <= precision_floor;
             const bool b_equivalent = eb <= precision_floor;
             if (a_equivalent != b_equivalent) return a_equivalent;
@@ -886,11 +900,16 @@ private:
             if (a.depth != b.depth) return a.depth < b.depth;
             if (ea != eb) return ea < eb;
             return a.hash < b.hash;
-        });
+        };
 
         std::vector<Candidate> keep;
         keep.reserve(cap);
         const std::size_t elegant_count = std::min(cap, std::max<std::size_t>(1, cap / 2));
+        if (elegant_count < all.size()) {
+            std::nth_element(all.begin(),
+                             all.begin() + static_cast<std::ptrdiff_t>(elegant_count),
+                             all.end(), elegance_order);
+        }
         keep.insert(keep.end(), all.begin(), all.begin() + static_cast<std::ptrdiff_t>(elegant_count));
 
         sort_range(all.begin() + static_cast<std::ptrdiff_t>(elegant_count), all.end(),
@@ -914,9 +933,8 @@ private:
                                                 candidate.depends_on_x, candidate.constraint_state,
                                                 value_bits_, derivative_sensitive_);
             const auto key = extra_key(candidate, state_key);
-            const auto it = extra_table_.find(key);
-            if (it == extra_table_.end()) extra_table_.emplace(key, candidate);
-            else if (more_elegant(candidate, it->second)) it->second = candidate;
+            const auto [it, inserted] = extra_table_.try_emplace(key, candidate);
+            if (!inserted && more_elegant(candidate, it->second)) it->second = candidate;
         }
     }
 
@@ -937,17 +955,30 @@ private:
             std::uint64_t key{};
             Candidate candidate;
         };
+        struct RankValue {
+            double value{};
+            double error{};
+        };
         std::vector<Entry> all;
         all.reserve(table_.size());
-        for (const auto& [key, candidate] : table_) all.push_back({key, candidate});
+        std::vector<RankValue> rank_values;
+        rank_values.reserve(table_.size());
+        for (const auto& [key, candidate] : table_) {
+            all.push_back({key, candidate});
+            rank_values.push_back({candidate.value, abs_error(candidate.value, target_)});
+        }
 
-        std::vector<std::size_t> order(all.size());
-        for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-        const auto near_better = [&](std::size_t i, std::size_t j) {
+        using Index = std::uint32_t;
+        if (all.size() > std::numeric_limits<Index>::max()) {
+            throw std::length_error("候选裁剪索引超过 32 位上限");
+        }
+        std::vector<Index> order(all.size());
+        for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<Index>(i);
+        const auto near_better = [&](Index i, Index j) {
             const Candidate& a = all[i].candidate;
             const Candidate& b = all[j].candidate;
-            const double ei = abs_error(a.value, target_);
-            const double ej = abs_error(b.value, target_);
+            const double ei = rank_values[i].error;
+            const double ej = rank_values[j].error;
             if (ei != ej) return ei < ej;
             if (a.nodes != b.nodes) return a.nodes < b.nodes;
             return a.hash < b.hash;
@@ -964,34 +995,34 @@ private:
         sort_range(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(near_count), near_better);
 
         std::vector<unsigned char> selected(all.size(), 0);
-        std::vector<std::size_t> keep_indices;
+        std::vector<Index> keep_indices;
         keep_indices.reserve(cap);
         for (std::size_t k = 0; k < near_count; ++k) {
             selected[order[k]] = 1;
             keep_indices.push_back(order[k]);
         }
 
-        std::vector<std::size_t> rest;
+        std::vector<Index> rest;
         rest.reserve(all.size() - near_count);
         for (std::size_t i = 0; i < all.size(); ++i) {
-            if (!selected[i]) rest.push_back(i);
+            if (!selected[i]) rest.push_back(static_cast<Index>(i));
         }
-        sort_range(rest.begin(), rest.end(), [&](std::size_t i, std::size_t j) {
-            const Candidate& a = all[i].candidate;
-            const Candidate& b = all[j].candidate;
-            if (a.value != b.value) return a.value < b.value;
-            return a.hash < b.hash;
+        sort_range(rest.begin(), rest.end(), [&](Index i, Index j) {
+            if (rank_values[i].value != rank_values[j].value) {
+                return rank_values[i].value < rank_values[j].value;
+            }
+            return all[i].candidate.hash < all[j].candidate.hash;
         });
 
         const std::size_t spread_count = std::min(cap - keep_indices.size(), rest.size());
         if (spread_count == 1) {
-            const std::size_t selected_index = rest[rest.size() / 2];
+            const Index selected_index = rest[rest.size() / 2];
             selected[selected_index] = 1;
             keep_indices.push_back(selected_index);
         } else if (spread_count > 1) {
             for (std::size_t k = 0; k < spread_count; ++k) {
                 const std::size_t pos = (k * (rest.size() - 1)) / (spread_count - 1);
-                const std::size_t selected_index = rest[pos];
+                const Index selected_index = rest[pos];
                 selected[selected_index] = 1;
                 keep_indices.push_back(selected_index);
             }
@@ -1005,7 +1036,7 @@ private:
 
         table_.clear();
         table_.reserve(cap * 2 + 1);
-        for (const std::size_t index : keep_indices) {
+        for (const Index index : keep_indices) {
             // Entries came from table_, so their keys are already unique.
             table_.emplace(all[index].key, all[index].candidate);
         }
@@ -1026,14 +1057,23 @@ private:
         sort_range(all.begin(), all.end(), by_value);
 
         const std::size_t near_count = std::min(cap, std::max<std::size_t>(1, cap / 4));
-        std::vector<std::size_t> near_order(all.size());
-        for (std::size_t i = 0; i < near_order.size(); ++i) near_order[i] = i;
-        sort_range(near_order.begin(), near_order.end(), [&](std::size_t i, std::size_t j) {
+        using Index = std::uint32_t;
+        if (all.size() > std::numeric_limits<Index>::max()) {
+            throw std::length_error("方程候选裁剪索引超过 32 位上限");
+        }
+        std::vector<Index> near_order(all.size());
+        for (std::size_t i = 0; i < near_order.size(); ++i) near_order[i] = static_cast<Index>(i);
+        const auto near_better = [&](Index i, Index j) {
             const double a = abs_error(all[i].value, target_);
             const double b = abs_error(all[j].value, target_);
             if (a != b) return a < b;
             return by_value(all[i], all[j]);
-        });
+        };
+        if (near_count < near_order.size()) {
+            std::nth_element(near_order.begin(),
+                             near_order.begin() + static_cast<std::ptrdiff_t>(near_count),
+                             near_order.end(), near_better);
+        }
 
         std::vector<unsigned char> selected(all.size(), 0);
         std::vector<Candidate> keep;
@@ -1043,10 +1083,10 @@ private:
             keep.push_back(all[near_order[i]]);
         }
 
-        std::vector<std::size_t> rest;
+        std::vector<Index> rest;
         rest.reserve(all.size() - near_count);
         for (std::size_t i = 0; i < all.size(); ++i) {
-            if (!selected[i]) rest.push_back(i);
+            if (!selected[i]) rest.push_back(static_cast<Index>(i));
         }
         const std::size_t spread_count = std::min(cap - keep.size(), rest.size());
         if (spread_count == 1) {
@@ -1064,9 +1104,8 @@ private:
             const auto key = state_bucket(candidate.value, candidate.derivative,
                                            candidate.depends_on_x, candidate.constraint_state,
                                            value_bits_, derivative_sensitive_);
-            const auto it = table_.find(key);
-            if (it == table_.end()) table_.emplace(key, candidate);
-            else if (better(candidate, it->second)) it->second = candidate;
+            const auto [it, inserted] = table_.try_emplace(key, candidate);
+            if (!inserted && better(candidate, it->second)) it->second = candidate;
         }
     }
 
@@ -2695,11 +2734,19 @@ public:
     void consider_batch(const std::vector<Candidate>& candidates, unsigned current_cost) {
         if (capacity_ == 0 || candidates.empty()) return;
 
-        std::vector<Candidate> local;
-        local.reserve(std::min(capacity_, candidates.size()));
-        auto heap_compare = [&](const Candidate& a, const Candidate& b) { return better(a, b); };
+        FastMap<std::uint64_t, Candidate> local_bucket_best;
+        local_bucket_best.reserve(candidates.size() * 2 + 1);
         for (const Candidate& candidate : candidates) {
             if (!error_range_.contains(candidate.value - target_) || !acceptor_(candidate)) continue;
+            const auto key = rounded_value_bucket(candidate.value, value_bits_);
+            const auto [found, inserted] = local_bucket_best.try_emplace(key, candidate);
+            if (!inserted && more_elegant(candidate, found->second)) found->second = candidate;
+        }
+
+        std::vector<Candidate> local;
+        local.reserve(std::min(capacity_, local_bucket_best.size()));
+        auto heap_compare = [&](const Candidate& a, const Candidate& b) { return better(a, b); };
+        for (const auto& [_, candidate] : local_bucket_best) {
             if (local.size() < capacity_) {
                 local.push_back(candidate);
                 std::push_heap(local.begin(), local.end(), heap_compare);
@@ -2713,18 +2760,26 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<Candidate> merged = best_;
         merged.insert(merged.end(), local.begin(), local.end());
+
+        FastMap<std::uint64_t, Candidate> bucket_best;
+        bucket_best.reserve(merged.size() * 2 + 1);
+        for (const Candidate& candidate : merged) {
+            const auto key = rounded_value_bucket(candidate.value, value_bits_);
+            const auto [found, inserted] = bucket_best.try_emplace(key, candidate);
+            if (!inserted && more_elegant(candidate, found->second)) found->second = candidate;
+        }
+        merged.clear();
+        merged.reserve(bucket_best.size());
+        for (const auto& [_, candidate] : bucket_best) merged.push_back(candidate);
         std::sort(merged.begin(), merged.end(), [&](const Candidate& a, const Candidate& b) {
             return better(a, b);
         });
 
         std::vector<Candidate> next;
         next.reserve(std::min(capacity_, merged.size()));
-        FastSet<std::uint64_t> buckets;
-        buckets.reserve(capacity_ * 2 + 1);
         FastSet<std::string> formulas;
         formulas.reserve(capacity_ * 2 + 1);
         for (const Candidate& candidate : merged) {
-            if (!buckets.insert(value_bucket(candidate.value, value_bits_)).second) continue;
             if (!formulas.insert(latex_renderer_(candidate)).second) continue;
             next.push_back(candidate);
             if (next.size() == capacity_) break;
@@ -2754,6 +2809,16 @@ private:
         if (a.cost != b.cost) return a.cost < b.cost;
         if (a.nodes != b.nodes) return a.nodes < b.nodes;
         if (a.depth != b.depth) return a.depth < b.depth;
+        return a.hash < b.hash;
+    }
+
+    bool more_elegant(const Candidate& a, const Candidate& b) const {
+        if (a.cost != b.cost) return a.cost < b.cost;
+        if (a.nodes != b.nodes) return a.nodes < b.nodes;
+        if (a.depth != b.depth) return a.depth < b.depth;
+        const double ea = abs_error(a.value, target_);
+        const double eb = abs_error(b.value, target_);
+        if (ea != eb) return ea < eb;
         return a.hash < b.hash;
     }
 
@@ -2838,7 +2903,9 @@ public:
         unary_ops_ = std::move(parsed.first);
         binary_ops_ = std::move(parsed.second);
         arena_.reserve((cfg_.beam + pareto_extra_cap()) * cfg_.max_cost + atoms_.size());
-        seen_.reserve(cfg_.beam * cfg_.max_cost * 2 + atoms_.size());
+        const std::size_t expected_seen = cfg_.beam * cfg_.max_cost * 2 + atoms_.size();
+        seen_.reserve(expected_seen);
+        initialize_seen_filter(expected_seen);
         if (cfg_.pareto_slots > 1) {
             extra_seen_.reserve(pareto_extra_cap() * cfg_.max_cost * 2 + 1);
         }
@@ -2866,6 +2933,8 @@ public:
                       << "  \"pairs\": " << cfg_.pair_budget << ",\n"
                       << "  \"deep_frontier\": " << cfg_.deep_frontier << ",\n"
                       << "  \"threads\": " << cfg_.threads << ",\n"
+                      << "  \"value_bits\": " << cfg_.value_bits << ",\n"
+                      << "  \"result_value_bits\": " << cfg_.result_value_bits << ",\n"
                       << "  \"value_prune\": \"" << value_prune_mode_name(cfg_.value_prune) << "\",\n"
                       << "  \"explore_pairs\": " << cfg_.explore_pairs << ",\n"
                       << "  \"digits\": \"" << json_escape(cfg_.digits) << "\",\n"
@@ -2910,9 +2979,10 @@ public:
                   << "  Search mode       : " << configured_search_mode() << '\n'
                   << "  Cost              : " << cfg_.max_cost << " (generated " << generated_cost << ")\n"
                   << "  Beam / pairs      : " << cfg_.beam << " / " << cfg_.pair_budget << '\n'
-                   << "  Threads / bits    : " << cfg_.threads << " / " << cfg_.value_bits << '\n'
-                   << "  Value pruning     : " << value_prune_mode_name(cfg_.value_prune)
-                   << " (effective bits " << state_value_bits(cfg_) << ")\n"
+                  << "  Threads / bits    : " << cfg_.threads << " / " << cfg_.value_bits << '\n'
+                  << "  Result value bits : " << cfg_.result_value_bits << '\n'
+                  << "  Value pruning     : " << value_prune_mode_name(cfg_.value_prune)
+                  << " (effective bits " << state_value_bits(cfg_) << ")\n"
                   << "  Equation policy   : " << equation_search_mode_name(cfg_.equation_search)
                   << " / " << equation_quality_mode_name(cfg_.equation_quality) << '\n'
                   << "  Explore pairs     : " << cfg_.explore_pairs << " / outer candidate\n"
@@ -2944,7 +3014,7 @@ public:
         double best_error = std::numeric_limits<double>::infinity();
         double best_acceptable_error = std::numeric_limits<double>::infinity();
         LiveTopReporter live_reporter(
-            cfg_.target, state_value_bits(cfg_), cfg_.error_range, cfg_.live_top, cfg_.live_interval,
+            cfg_.target, cfg_.result_value_bits, cfg_.error_range, cfg_.live_top, cfg_.live_interval,
             [&](const Candidate& candidate) { return render_candidate_expression(atoms_, arena_, candidate); },
             [&](const Candidate& candidate) { return render_candidate_latex(atoms_, arena_, candidate); },
             cfg_.live_json, cfg_.latex,
@@ -2984,7 +3054,7 @@ public:
                 candidate.depends_on_x = atom.variable;
                 const auto key = state_bucket(candidate.value, candidate.derivative, candidate.depends_on_x,
                                               candidate.constraint_state, state_value_bits(cfg_), cfg_.equations);
-                if (seen_.find(key) == seen_.end()) {
+                if (!has_seen_state(key)) {
                     global.consider_with_key(candidate, key);
                     if (cfg_.live && !cfg_.equations) atom_candidates.push_back(candidate);
                 } else {
@@ -3001,7 +3071,7 @@ public:
                 for (const auto& candidate : result.candidates) {
                     const auto key = state_bucket(candidate.value, candidate.derivative, candidate.depends_on_x,
                                                   candidate.constraint_state, state_value_bits(cfg_), cfg_.equations);
-                    if (seen_.find(key) == seen_.end()) {
+                    if (!has_seen_state(key)) {
                         global.consider_with_key(candidate, key);
                     } else {
                         global.consider_extra_only(candidate);
@@ -3032,8 +3102,9 @@ public:
                 return arena_[a].hash < arena_[b].hash;
             });
             for (ExprId id : layer) {
-                seen_.emplace(state_bucket(arena_[id].value, arena_[id].derivative, arena_[id].depends_on_x,
-                                           arena_[id].constraint_state, state_value_bits(cfg_), cfg_.equations));
+                remember_seen_state(state_bucket(
+                    arena_[id].value, arena_[id].derivative, arena_[id].depends_on_x,
+                    arena_[id].constraint_state, state_value_bits(cfg_), cfg_.equations));
                 const double error = abs_error(arena_[id].value, cfg_.target);
                 best_error = std::min(best_error, error);
                 if (cfg_.error_range.contains(arena_[id].value - cfg_.target) &&
@@ -3198,6 +3269,36 @@ private:
         if (cfg_.pareto_slots <= 1) return 0;
         if (cfg_.pareto_extra != 0) return cfg_.pareto_extra;
         return std::max<std::size_t>(32, cfg_.beam / 4);
+    }
+
+    void initialize_seen_filter(std::size_t expected_entries) {
+        constexpr std::size_t minimum_words = 1024;
+        constexpr std::size_t maximum_words = 1U << 20U;
+        const std::size_t requested_words = std::clamp(
+            expected_entries / 4 + static_cast<std::size_t>(expected_entries % 4 != 0),
+            minimum_words, maximum_words);
+        const std::size_t words = std::bit_ceil(requested_words);
+        seen_filter_.assign(words, 0);
+        seen_filter_mask_ = words - 1;
+    }
+
+    std::pair<std::size_t, std::uint64_t> seen_filter_probe(std::uint64_t key) const {
+        const std::uint64_t hash = mix64(key);
+        const std::uint64_t bits = (1ULL << (hash & 63U)) |
+                                   (1ULL << ((hash >> 6U) & 63U));
+        return {static_cast<std::size_t>((hash >> 12U) & seen_filter_mask_), bits};
+    }
+
+    bool has_seen_state(std::uint64_t key) const {
+        const auto [word, bits] = seen_filter_probe(key);
+        if ((seen_filter_[word] & bits) != bits) return false;
+        return seen_.find(key) != seen_.end();
+    }
+
+    void remember_seen_state(std::uint64_t key) {
+        seen_.emplace(key);
+        const auto [word, bits] = seen_filter_probe(key);
+        seen_filter_[word] |= bits;
     }
 
     ExprId append_candidate_node(const Candidate& candidate, bool eligible = true) {
@@ -3556,8 +3657,8 @@ private:
                 node.eligible = true;
                 layers_[node.cost].push_back(id);
                 touched_cost[node.cost] = 1;
-                seen_.emplace(state_bucket(node.value, node.derivative, node.depends_on_x,
-                                           node.constraint_state, state_value_bits(cfg_), false));
+                remember_seen_state(state_bucket(node.value, node.derivative, node.depends_on_x,
+                                                 node.constraint_state, state_value_bits(cfg_), false));
                 ++stats_.kept;
                 if (newly_eligible) *newly_eligible = true;
             }
@@ -3567,14 +3668,14 @@ private:
         const std::uint64_t value_key = state_bucket(
             candidate.value, candidate.derivative, candidate.depends_on_x,
             candidate.constraint_state, state_value_bits(cfg_), false);
-        if (eligible && prune_by_value && seen_.find(value_key) != seen_.end()) return kNoExpr;
+        if (eligible && prune_by_value && has_seen_state(value_key)) return kNoExpr;
 
         const ExprId id = append_candidate_node(candidate, eligible);
         structure_index.emplace(candidate.hash, id);
         if (eligible) {
             layers_[candidate.cost].push_back(id);
             touched_cost[candidate.cost] = 1;
-            seen_.emplace(value_key);
+            remember_seen_state(value_key);
             ++stats_.kept;
             if (newly_eligible) *newly_eligible = true;
         }
@@ -4213,7 +4314,7 @@ private:
             for (const Candidate& candidate : survivors) {
                 const auto key = state_bucket(candidate.value, candidate.derivative, candidate.depends_on_x,
                                               candidate.constraint_state, state_value_bits(cfg_), cfg_.equations);
-                if (seen_.find(key) != seen_.end()) continue;
+                if (has_seen_state(key)) continue;
                 if (arena_.size() >= kNoExpr) throw std::runtime_error("表达式数量超过 32 位索引上限");
                 Node node;
                 node.value = candidate.value;
@@ -4232,7 +4333,7 @@ private:
                 const ExprId id = static_cast<ExprId>(arena_.size());
                 arena_.push_back(node);
                 layer.push_back(id);
-                seen_.emplace(key);
+                remember_seen_state(key);
                 remember_primary_hash(candidate.hash);
             }
             for (const Candidate& candidate : extra_survivors) append_extra_candidate(candidate);
@@ -4305,7 +4406,7 @@ private:
                 const auto key = state_bucket(candidate->value, candidate->derivative,
                                               candidate->depends_on_x, candidate->constraint_state,
                                               state_value_bits(cfg_), false);
-                if (seen_.find(key) == seen_.end()) collector.consider_with_key(*candidate, key);
+                if (!has_seen_state(key)) collector.consider_with_key(*candidate, key);
                 else collector.consider_extra_only(*candidate);
             }
         }
@@ -4327,29 +4428,36 @@ private:
         };
 
         std::vector<ExprId> ranked = ids;
-        std::sort(ranked.begin(), ranked.end(), [&](ExprId a, ExprId b) {
+        const auto near_order = [&](ExprId a, ExprId b) {
             const double ea = std::abs(arena_[a].value - cfg_.target);
             const double eb = std::abs(arena_[b].value - cfg_.target);
             if (ea != eb) return ea < eb;
             if (arena_[a].nodes != arena_[b].nodes) return arena_[a].nodes < arena_[b].nodes;
             if (arena_[a].depth != arena_[b].depth) return arena_[a].depth < arena_[b].depth;
             return arena_[a].hash < arena_[b].hash;
-        });
+        };
         const std::size_t near_quota = std::max<std::size_t>(1, (limit * 2) / 5);
+        std::partial_sort(ranked.begin(),
+                          ranked.begin() + static_cast<std::ptrdiff_t>(near_quota),
+                          ranked.end(), near_order);
         for (std::size_t i = 0; i < near_quota; ++i) add(ranked[i]);
 
-        std::sort(ranked.begin(), ranked.end(), [&](ExprId a, ExprId b) {
+        const auto elegance_order = [&](ExprId a, ExprId b) {
             if (arena_[a].nodes != arena_[b].nodes) return arena_[a].nodes < arena_[b].nodes;
             if (arena_[a].depth != arena_[b].depth) return arena_[a].depth < arena_[b].depth;
             const double ea = std::abs(arena_[a].value - cfg_.target);
             const double eb = std::abs(arena_[b].value - cfg_.target);
             if (ea != eb) return ea < eb;
             return arena_[a].hash < arena_[b].hash;
-        });
+        };
+        const std::size_t elegance_scan = std::min(limit, ranked.size());
+        std::partial_sort(ranked.begin(),
+                          ranked.begin() + static_cast<std::ptrdiff_t>(elegance_scan),
+                          ranked.end(), elegance_order);
         const std::size_t elegant_target = std::min(limit, near_quota + (limit * 3) / 10);
-        for (ExprId id : ranked) {
+        for (std::size_t i = 0; i < elegance_scan; ++i) {
             if (selected.size() >= elegant_target) break;
-            add(id);
+            add(ranked[i]);
         }
 
         // ids is value-sorted.  Uniform quantiles preserve numerically remote
@@ -4438,7 +4546,7 @@ private:
                             const auto key = state_bucket(candidate->value, candidate->derivative,
                                                           candidate->depends_on_x, candidate->constraint_state,
                                                           state_value_bits(cfg_), false);
-                            if (seen_.find(key) == seen_.end()) local.consider_with_key(*candidate, key);
+                            if (!has_seen_state(key)) local.consider_with_key(*candidate, key);
                             else local.consider_extra_only(*candidate);
                         }
                         result.candidates = local.take(deep_cap);
@@ -4524,7 +4632,7 @@ private:
                     const auto state_key = state_bucket(candidate.value, candidate.derivative,
                                                         candidate.depends_on_x, candidate.constraint_state,
                                                         state_value_bits(cfg_), false);
-                    const bool new_state = seen_.find(state_key) == seen_.end();
+                    const bool new_state = !has_seen_state(state_key);
                     if (!new_state && cfg_.pareto_slots <= 1) continue;
                     if (!archive_hashes.emplace(candidate.hash).second) continue;
                     const ExprId id = append_candidate_node(candidate);
@@ -4532,7 +4640,7 @@ private:
                     next_frontier[cost].push_back(id);
                     all_layers[cost].push_back(id);
                     extra_seen_.emplace(candidate.hash);
-                    if (new_state) seen_.emplace(state_key);
+                    if (new_state) remember_seen_state(state_key);
                     ++appended;
                     ++stats_.kept;
                     if (!new_state) ++stats_.pareto_extras;
@@ -6040,10 +6148,10 @@ private:
                 const auto key = state_bucket(candidate.value, candidate.derivative,
                                               candidate.depends_on_x, candidate.constraint_state,
                                               state_value_bits(cfg_), false);
-                if (seen_.find(key) != seen_.end()) continue;
+                if (has_seen_state(key)) continue;
                 const ExprId id = append_candidate_node(candidate, true);
                 layers_[candidate.cost].push_back(id);
-                seen_.emplace(key);
+                remember_seen_state(key);
                 touched_cost[candidate.cost] = 1;
                 library_touched[candidate.cost] = 1;
                 library_by_cost[candidate.cost].push_back(id);
@@ -6230,7 +6338,7 @@ private:
                     const auto key = state_bucket(candidate->value, candidate->derivative,
                                                   candidate->depends_on_x, candidate->constraint_state,
                                                   state_value_bits(cfg_), cfg_.equations);
-                    if (seen_.find(key) == seen_.end()) {
+                    if (!has_seen_state(key)) {
                         collector.consider_with_key(*candidate, key);
                     } else {
                         collector.consider_extra_only(*candidate);
@@ -6259,7 +6367,7 @@ private:
                 const auto key = state_bucket(candidate->value, candidate->derivative,
                                               candidate->depends_on_x, candidate->constraint_state,
                                               state_value_bits(cfg_), cfg_.equations);
-                if (seen_.find(key) == seen_.end()) {
+                if (!has_seen_state(key)) {
                     collector.consider_with_key(*candidate, key);
                 } else {
                     collector.consider_extra_only(*candidate);
@@ -6383,6 +6491,8 @@ private:
     std::vector<Node> arena_;
     std::vector<std::vector<ExprId>> layers_;
     std::vector<std::vector<ExprId>> extra_layers_;
+    std::vector<std::uint64_t> seen_filter_;
+    std::size_t seen_filter_mask_{};
     FastSet<std::uint64_t> seen_;
     FastSet<std::uint64_t> extra_seen_;
     SearchStats stats_;
@@ -7212,12 +7322,22 @@ struct Match {
     double rel_err{};
     unsigned cost{};
     unsigned nodes{};
+    unsigned depth{};
 };
 
 static bool match_better(const Match& a, const Match& b) {
     if (a.abs_err != b.abs_err) return a.abs_err < b.abs_err;
     if (a.cost != b.cost) return a.cost < b.cost;
     if (a.nodes != b.nodes) return a.nodes < b.nodes;
+    if (a.depth != b.depth) return a.depth < b.depth;
+    return a.id < b.id;
+}
+
+static bool match_more_elegant(const Match& a, const Match& b) {
+    if (a.cost != b.cost) return a.cost < b.cost;
+    if (a.nodes != b.nodes) return a.nodes < b.nodes;
+    if (a.depth != b.depth) return a.depth < b.depth;
+    if (a.abs_err != b.abs_err) return a.abs_err < b.abs_err;
     return a.id < b.id;
 }
 
@@ -7234,11 +7354,10 @@ static std::vector<Match> collect_matches(const SearchRun& run) {
             if (run.cfg.error_range.contains(signed_error) &&
                 constraint_satisfied(run.cfg, node.constraint_state)) {
                 Match candidate{id, node.value, signed_error, error,
-                                rel_error(node.value, run.cfg.target), node.cost, node.nodes};
-                const std::uint64_t key = value_bucket(node.value, 52);
-                const auto found = best_by_value.find(key);
-                if (found == best_by_value.end()) best_by_value.emplace(key, candidate);
-                else if (match_better(candidate, found->second)) found->second = candidate;
+                                rel_error(node.value, run.cfg.target), node.cost, node.nodes, node.depth};
+                const std::uint64_t key = rounded_value_bucket(node.value, run.cfg.result_value_bits);
+                const auto [found, inserted] = best_by_value.try_emplace(key, candidate);
+                if (!inserted && match_more_elegant(candidate, found->second)) found->second = candidate;
             }
         }
         matches.reserve(best_by_value.size());
@@ -7256,7 +7375,7 @@ static std::vector<Match> collect_matches(const SearchRun& run) {
         for (const ExprId id : run.layers[cost]) {
             const Node& node = run.arena[id];
             Match m{id, node.value, node.value - run.cfg.target, abs_error(node.value, run.cfg.target),
-                    rel_error(node.value, run.cfg.target), node.cost, node.nodes};
+                    rel_error(node.value, run.cfg.target), node.cost, node.nodes, node.depth};
             if (!run.cfg.error_range.contains(m.signed_err) ||
                 !constraint_satisfied(run.cfg, node.constraint_state)) continue;
             if (!layer_best || match_better(m, *layer_best)) layer_best = m;
@@ -7265,7 +7384,7 @@ static std::vector<Match> collect_matches(const SearchRun& run) {
             for (const ExprId id : run.extra_layers[cost]) {
                 const Node& node = run.arena[id];
                 Match m{id, node.value, node.value - run.cfg.target, abs_error(node.value, run.cfg.target),
-                        rel_error(node.value, run.cfg.target), node.cost, node.nodes};
+                        rel_error(node.value, run.cfg.target), node.cost, node.nodes, node.depth};
                 if (!run.cfg.error_range.contains(m.signed_err) ||
                     !constraint_satisfied(run.cfg, node.constraint_state)) continue;
                 if (!layer_best || match_better(m, *layer_best)) layer_best = m;
@@ -7712,8 +7831,8 @@ static void print_help(const char* program) {
         << "  --threads N               工作线程数，默认硬件并发数\n"
         << "  --task-chunks N           每个组合分区的固定任务块数，默认 64\n"
         << "  --value-bits N            数值分桶保留的尾数位，0..52，默认 42\n"
-        << "  --value-prune MODE       数值去重：bucket（按 value-bits）或 exact（严格 double 值），默认 bucket\n"
-        << "  --explore-pairs N        每个非完整外层额外确定性采样的二元组合数，0=关闭，默认 0（最大 1000000）\n"
+        << "  --value-prune MODE         数值去重：bucket（按 value-bits）或 exact（严格 double 值），默认 bucket\n"
+        << "  --explore-pairs N          每个非完整外层额外确定性采样的二元组合数，0=关闭，默认 0（最大 1000000）\n"
         << "  --pareto-slots N          每个数值桶结构槽数，1..4，默认 1（侧车不挤占 beam）\n"
         << "  --pareto-extra N          每成本侧车候选上限，0=自动，默认 0\n"
         << "  --inverse-neighbors N     每次逆值查询的近邻数，默认 5\n"
@@ -7764,6 +7883,7 @@ static void print_help(const char* program) {
         << "  --no-stop                 即使达到 epsilon 仍搜索到 max-cost\n"
         << "  --no-bidirectional        禁用半表达式合并，改用完整逐层搜索\n"
         << "  --results N               输出条数，默认 20\n"
+        << "  --result-value-bits N      最终与实时结果去重尾数位，0..52，默认 48；52 仅合并严格相同值\n"
         << "  --mode pareto|nearest     复杂度-精度前沿或最接近结果，默认 nearest\n"
         << "  --live                    搜索期间在 stderr 刷新当前 top N（N 取 --results）\n"
         << "  --live-top N              搜索期间在 stderr 刷新当前 top N\n"
@@ -8184,6 +8304,9 @@ static Config parse_cli(int argc, char** argv) {
             cfg.task_chunks = static_cast<std::size_t>(parse_u64(option_value(i, argc, argv, arg, "--task-chunks"), "--task-chunks"));
         } else if (option_matches(arg, "--value-bits")) {
             cfg.value_bits = parse_unsigned(option_value(i, argc, argv, arg, "--value-bits"), "--value-bits");
+        } else if (option_matches(arg, "--result-value-bits")) {
+            cfg.result_value_bits = parse_unsigned(
+                option_value(i, argc, argv, arg, "--result-value-bits"), "--result-value-bits");
         } else if (option_matches(arg, "--value-prune")) {
             const std::string mode = option_value(i, argc, argv, arg, "--value-prune");
             if (mode == "bucket") cfg.value_prune = ValuePruneMode::Bucket;
@@ -8428,6 +8551,9 @@ static Config parse_cli(int argc, char** argv) {
     if (cfg.threads == 0) cfg.threads = std::max(1U, std::thread::hardware_concurrency());
     if (cfg.task_chunks == 0) throw std::runtime_error("--task-chunks 必须大于 0");
     if (cfg.value_bits > 52) throw std::runtime_error("--value-bits 必须在 0..52 之间");
+    if (cfg.result_value_bits > 52) {
+        throw std::runtime_error("--result-value-bits 必须在 0..52 之间");
+    }
     if (cfg.explore_pairs > 1'000'000) {
         throw std::runtime_error("--explore-pairs 不能超过 1000000");
     }
@@ -8567,6 +8693,37 @@ static int run_self_test() {
               "有符号负误差区间");
     }
     {
+        const double center = 21.0;
+        const double below = std::nextafter(center, -std::numeric_limits<double>::infinity());
+        const double above = std::nextafter(center, std::numeric_limits<double>::infinity());
+        const bool rounded_together = rounded_value_bucket(center, 48) == rounded_value_bucket(below, 48) &&
+                                      rounded_value_bucket(center, 48) == rounded_value_bucket(above, 48);
+        const bool exact_distinct = rounded_value_bucket(center, 52) != rounded_value_bucket(below, 52) &&
+                                    rounded_value_bucket(center, 52) != rounded_value_bucket(above, 52);
+        check(rounded_together && exact_distinct, "结果数值桶合并相邻 ULP 且支持严格模式");
+    }
+    {
+        SearchRun run;
+        run.cfg.target = 21.0;
+        run.cfg.mode = "nearest";
+        run.cfg.results = 4;
+        run.cfg.result_value_bits = 48;
+        run.cfg.symbol_constraints = compile_symbol_constraints(run.cfg, {});
+        run.cfg.extension_constraints = compile_extension_constraints();
+        run.arena.resize(2);
+        run.arena[0].value = std::nextafter(21.0, std::numeric_limits<double>::infinity());
+        run.arena[0].cost = 8;
+        run.arena[0].nodes = 7;
+        run.arena[0].hash = 2;
+        run.arena[1].value = 21.0;
+        run.arena[1].cost = 1;
+        run.arena[1].nodes = 1;
+        run.arena[1].hash = 1;
+        const auto matches = collect_matches(run);
+        check(matches.size() == 1 && matches.front().id == 1 && matches.front().cost == 1,
+              "同一结果数值桶保留更简洁表达式");
+    }
+    {
         std::array<long double, 4> values{2.0L, 1.0L, 0.0L, 0.0L};
         const auto relation = find_integer_relation(values, 2, 1.0e-15L, 8, 32);
         check(relation && relation->coefficients[0] == 1 && relation->coefficients[1] == -2,
@@ -8598,6 +8755,8 @@ static int run_self_test() {
             {"fates", "1", "--search-mode", "deterministic", "--genetic"});
         const Config exact_and_explore = parse_arguments(
             {"fates", "1", "--value-prune", "exact", "--explore-pairs", "3"});
+        const Config result_precision = parse_arguments(
+            {"fates", "1", "--result-value-bits", "47"});
         const Config portfolio = parse_arguments(
             {"fates", "1", "--search-mode", "portfolio"});
         const Config genetic_portfolio = parse_arguments(
@@ -8612,7 +8771,8 @@ static int run_self_test() {
         check(automatic.genetic && !deterministic_first.genetic && !deterministic_last.genetic &&
                    !deterministic_with_flag.genetic &&
                    exact_and_explore.value_prune == ValuePruneMode::Exact &&
-                   exact_and_explore.explore_pairs == 3 && portfolio.portfolio &&
+                   exact_and_explore.explore_pairs == 3 && result_precision.result_value_bits == 47 &&
+                   portfolio.portfolio &&
                    portfolio.inverse_depth >= 1 && portfolio.deep_rounds >= 1 &&
                    portfolio.pareto_slots >= 2 && !portfolio.stop_on_epsilon &&
                    genetic_portfolio.portfolio && genetic_portfolio.genetic &&
@@ -8624,7 +8784,7 @@ static int run_self_test() {
                     reduced_portfolio.pslq && reduced_portfolio.egraph && !reduced_portfolio.mcts &&
                     equation_policy.equation_search == EquationSearchMode::Wide &&
                    equation_policy.equation_quality == EquationQualityMode::Local,
-              "搜索模式、严格数值剪枝与方程策略解析稳定");
+              "搜索模式、数值去重精度与方程策略解析稳定");
     }
     {
         std::vector<std::string> arguments{
