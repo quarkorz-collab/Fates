@@ -67,11 +67,21 @@ fi
 "$BIN" 9.89897948556636 --digits 23 --constants none --ops '+,sqrt,^' \
   --max-cost 8 --side-cost 4 --beam 50 --pairs 1000 --value-bits 48 \
   --deep-rounds 1 --deep-beam 100 --no-stats | grep -F '(sqrt(3)+sqrt(2))^2' >/dev/null
-inverse_output=$("$BIN" 1.0218971486541166 --digits 2 --constants none --ops '+:5,sqrt' \
-  --max-cost 6 --side-cost 4 --beam 50 --pairs 1000 \
-  --inverse-depth 2 --inverse-beam 32 --inverse-budget 10000 --results 20 2>&1)
-printf '%s\n' "$inverse_output" | grep -F 'sqrt(sqrt(sqrt(sqrt(sqrt(2)))))' >/dev/null
-printf '%s\n' "$inverse_output" | grep -F 'strategy=mitm+inverse completed_cost=6 generated_cost=4' >/dev/null
+# The terminal unary closure owns unary chains above the side cost, so this case
+# checks the closure itself; the recursive inverse templates are probed below
+# with a shape they still own.
+closure_output=$("$BIN" 1.0218971486541166 --digits 2 --constants none --ops '+:5,sqrt' \
+  --max-cost 6 --side-cost 4 --beam 50 --pairs 1000 --results 20 2>&1)
+printf '%s\n' "$closure_output" | grep -F 'sqrt(sqrt(sqrt(sqrt(sqrt(2)))))' >/dev/null
+printf '%s\n' "$closure_output" | grep -F 'strategy=mitm+unary completed_cost=6 generated_cost=4' >/dev/null
+printf '%s\n' "$closure_output" | grep -E 'unary_candidates=[1-9][0-9]*' >/dev/null
+# 3*sqrt(2) at cost eight cannot be split into two sides of at most cost three,
+# and its root is binary, so only the recursive inverse templates reach it.
+inverse_output=$("$BIN" 4.242640687119285 --digits 2 --max-literal-len 1 --constants none \
+  --ops '+,sqrt' --max-cost 8 --side-cost 3 --beam 200 --pairs 100000 \
+  --inverse-depth 2 --inverse-beam 64 --inverse-budget 200000 --results 20 2>&1)
+printf '%s\n' "$inverse_output" | grep -F 'sqrt(2)+sqrt(2)+sqrt(2)' >/dev/null
+printf '%s\n' "$inverse_output" | grep -E 'inverse_candidates=[1-9][0-9]*' >/dev/null
 genetic_output=$("$BIN" 9.89897948556636 --digits 23 --constants none --ops '+,sqrt,^' \
   --max-cost 8 --side-cost 4 --beam 50 --pairs 1000 --value-bits 48 \
   --genetic --genetic-population 4096 --genetic-generations 64 \

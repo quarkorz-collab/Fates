@@ -17,12 +17,15 @@ Fates 根据给定的目标值，搜索由数字、常数和运算符组成的�
 - 分层搜索、beam 限制、二元组合预算和数值去重；
 - 常量表达式和方程两种搜索模式；
 - 自定义数字、常数、运算符、符号次数和叶子顺序；
-- 双向搜索、递归逆模板、深层组合，以及可选的 PSLQ、等式饱和、MCTS 和遗传搜索；
+- 双向搜索、终局一元闭合、锚点扩展、递归逆模板、深层组合，以及可选的 PSLQ、等式饱和、MCTS 和遗传搜索；
+- 候选归档按状态键分片并行合并，结果与 `--threads` 无关；
 - 普通文本、LaTeX、JSON 和实时结果输出；
 - UTF-8 参数文件和源码扩展接口；
 - 内置本地网页界面，静态资源包含 KaTeX，无需联网渲染公式。
 
-搜索是有界的。`--beam`、`--pairs`、数值去重和各扩展阶段的预算都会影响结果，程序不保证枚举给定复杂度内的全部表达式。
+搜索是有界的。`--beam`、`--pairs`、数值去重和各扩展阶段的预算都会影响结果，程序不保证枚举给定复杂度内的全部表达式。同一组参数在任意 `--threads` 下给出相同结果。
+
+`--beam` 是最能决定“还差多远”的参数：把它调大主要增加 meet-in-the-middle 阶段的时间，通常能明显降低最优误差。
 
 ## 构建
 
@@ -67,7 +70,7 @@ make -j
 .\scripts\build-pgo-windows.ps1 -EnableAVX2
 ```
 
-脚本会自动查找 MSVC x64 工具链，依次完成插桩编译、代表性搜索训练、配置文件合并、优化链接和自测。默认输出到 `artifacts/windows-x64-pgo-avx2/`。不加 `-EnableAVX2` 会生成通用 CPU 版本；`-Training quick` 可缩短训练时间，默认 `balanced` 会额外覆盖 portfolio 搜索路径。
+脚本会自动查找 MSVC x64 工具链，依次完成插桩编译、代表性搜索训练、配置文件合并、优化链接和自测。默认输出到 `artifacts/windows-x64-pgo-avx2/`。不加 `-EnableAVX2` 会生成通用 CPU 版本；`-Training quick` 只跑 `base` 训练集以缩短时间，默认 `balanced` 会额外覆盖各类可选阶段。插桩后的程序比优化版慢一个量级，`balanced` 训练本身约需四分钟。
 
 Linux 上使用 GCC 构建相同训练标准的 PGO 版本：
 
@@ -75,7 +78,13 @@ Linux 上使用 GCC 构建相同训练标准的 PGO 版本：
 bash scripts/build-pgo-linux.sh --enable-avx2 --training balanced
 ```
 
-默认输出到 `artifacts/linux-x64-pgo-avx2/`。正式发布构建固定使用 `balanced`。Windows 和 Linux 都读取 [`scripts/pgo-workloads.json`](scripts/pgo-workloads.json) 中的 `release-balanced-v2`：版本启动、自测、确定性搜索、遗传搜索、方程搜索和带受控高级预算的 portfolio 搜索使用同一组训练负载。`build-info.txt` 会记录 profile 名和训练文件 SHA-256，便于核对发布包没有使用缩减训练。
+默认输出到 `artifacts/linux-x64-pgo-avx2/`。正式发布构建固定使用 `balanced`。Windows 和 Linux 都读取 [`scripts/pgo-workloads.json`](scripts/pgo-workloads.json) 中的 `release-balanced-v3`。
+
+`base` 是 `quick` 与 `balanced` 都会跑的部分，覆盖每次搜索都会经过的路径：版本启动、自测、确定性搜索、宽 beam 确定性搜索、完整逐层搜索、遗传搜索和方程搜索。`balanced` 额外训练只在部分配置下才进入的代码：Pareto 与结构候选、深层组合、递归逆模板、全运算符集合（含三角、双曲、gamma、阶乘）、符号次数约束、有理逼近与误差区间、`exact` 数值去重与探索采样、实时 JSON 输出、方程的 `local` 与 `exhaustive` 策略，以及带受控预算的 portfolio 搜索。
+
+`build-info.txt` 会记录 profile 名和训练文件 SHA-256，便于核对发布包没有使用缩减训练。改动训练集后可以先用 `python tests/check_pgo_workloads.py --bin build/fates` 确认每个负载都能正常退出——PGO 脚本遇到非零退出会中止。
+
+扩大训练集的收益是覆盖率，不是速度：把 6 个负载扩到 16 个后，基准套件上是持平的（10 项都在 ±5% 内，多数在 ±2% 内），但此前只能依赖静态启发式的阶段现在都有了真实剖析数据。训练负载仍应贴近真实用法——同一段代码只在小规模上训练，优化器会按不匹配的分支权重排布它。
 
 PGO 配置文件与生成它的源码、编译器版本和编译选项绑定，不能可靠地跨版本复用，因此脚本每次都从当前源码重新训练。
 
@@ -187,6 +196,10 @@ PowerShell 中建议给区间加引号，以保留括号的开闭含义。
 
 `--equation-quality` 可选 `strict`、`local` 或 `off`。默认模式会对候选根重新求值，并检查邻域定义域和导数。方程模式不支持遗传、PSLQ、e-graph、MCTS、递归逆模板和深层组合。
 
+`strict` 和 `local` 都要求候选根是残差的**孤立零点**：残差在根处落到两侧操作数的可分辨精度以内，并且在根两侧重新变得可分辨。这条规则排除掉数值吸收造成的伪解——`exp(sqrt(x))-inv(x)` 在 x 较大时与 `exp(sqrt(x))` 是同一个 double，残差在整段区间上恒为零，`x = x+inv(8)/x` 同理无解。不要求变号，因此 `x = x^x` 在 1 处的切触根仍会被保留。`off` 不做这项检查。
+
+方程搜索的两侧都直接取自生成层，没有 meet-in-the-middle 阶段，因此单侧成本上限约为 `--max-cost` 的一半，且配对只在按数值排序后的 `--equation-neighbors` 邻域内进行。想放宽可以调 `--side-cost` 和 `--equation-neighbors`，但代价陡峭且收益少见：在实测的五个目标里，同时放宽两者要花 4–15 倍时间，只有一个目标的误差从 2.40e-7 改善到 1.01e-7，其余完全不变。
+
 ### 搜索扩展
 
 以下选项默认关闭：
@@ -262,6 +275,7 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 | `--threads N` | 工作线程数；`0` 使用硬件并发数 | 硬件并发数 |
 | `--task-chunks N` | 每个组合分区的任务块数 | `64` |
 | `--value-bits N` | 数值分桶保留的尾数位 | `42` |
+| `--near-fraction X` | 生成层中靠近目标的候选占比，`0.02..1` | `0.6` |
 | `--value-prune MODE` | `bucket` 或 `exact` | `bucket` |
 | `--result-value-bits N` | 最终与实时结果去重尾数位；`52` 仅合并严格相同值 | `48` |
 | `--side-cost N` | 双向搜索的单边成本；`0` 自动选择 | 自动 |
@@ -332,10 +346,17 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 
 - 表达式按复杂度分层生成，候选使用紧凑 AST 索引保存，最后一步才渲染文本；
 - 数值分桶、成本上限和组合预算共同控制候选数量；
-- 默认模式先生成单边表达式，再通过 meet-in-the-middle 合并；
+- 默认模式先生成单边表达式（成本上限约为 `--max-cost` 的一半），再通过 meet-in-the-middle 合并；
+- 每层的候选先由工作线程各自筛选，再按状态键分片并行合入该成本的归档。分片数是编译期常量、每个分片按任务顺序消费，因此归档只取决于搜索参数，`--threads` 不改变结果；
+- 终局阶段按成本升序结算，并在结算前补两类单边搜索无法覆盖的形状：
+  - **一元闭合**：对已结算的层逐一施加一元算子，恢复 `sqrt(5+5+4)` 这类根为一元、参数本身已超过单边成本的表达式；开销与层宽成正比；
+  - **锚点扩展**：把已结算的高成本层当作昂贵的一侧，与低成本锚点配对。目标值决定了昂贵一侧必须取的数值，因此每个锚点只需一次窗口查找，可覆盖 `9×(9-e)×(pi+6)+4` 这类几乎全部成本压在一侧的树；
+- 配对循环在与层平行的连续数值数组上二分，并从上一次的位置向外跳跃查找：内置运算的目标伙伴沿值序单调移动，通常两三次探测即可命中；
 - 高级阶段统一复用 AST 求值、成本和约束状态转移，不创建绕过符号集合的隐式常数；
 - 方程模式额外保存目标点处的导数，并对候选根做数值复核；
 - 源码扩展可以注册运算和结构约束，详见 [`docs/EXTENDING.md`](docs/EXTENDING.md)。
+
+`--near-fraction` 控制生成层里“靠近目标”的候选占比，其余预算用于覆盖数值轴。默认 `0.6` 偏向“接近目标的一侧 + 小修正伙伴”这一最常见形状；把它调小会把预算移向数值轴覆盖，对需要两侧都远离目标的等式更有利。
 
 ## 测试和基准
 
@@ -345,18 +366,41 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 ./fates --self-test
 ```
 
-CMake 构建使用 CTest 注册同一项自测。完整命令行回归位于 `tests/smoke.sh`；容器后端比较位于 `tests/benchmark_containers.ps1`。基准结果会受到处理器、编译器、线程数和系统负载影响，不应直接作为跨机器性能结论。
+CMake 构建使用 CTest 注册同一项自测。完整命令行回归位于 `tests/smoke.sh`；容器后端比较位于 `tests/benchmark_containers.ps1`。
+
+搜索性能和漏解情况有两个专用脚本，都只依赖标准库：
+
+```bash
+# 交替计时两个二进制并取各自最快一次，抵消后台负载
+python tests/bench_search.py --bin build/fates --compare build-old/fates
+
+# 用同一二进制的完整逐层搜索（--no-bidirectional，大 beam）作参考，
+# 统计默认有界搜索还差多少
+python tests/bench_search.py --bin build/fates --only recall \
+  --reference-cache artifacts/recall-reference.json
+
+# 在恒定预算下权衡 beam 宽度与窗口宽度
+python tests/sweep_search.py --bin build/fates \
+  --reference-cache artifacts/recall-reference.json \
+  --beam 3000 6000 9000 --neighbors 3 5
+```
+
+`recall` 的参考值会缓存到 `--reference-cache`，重复运行时不再重算。基准结果会受到处理器、编译器、线程数和系统负载影响，不应直接作为跨机器性能结论。
+
+Windows 上没有 Developer Prompt 时，可用 `scripts/dev-build.ps1` 直接调用 Visual Studio 自带的 MSVC 与 Ninja 完成配置和构建。
 
 GitHub Actions 使用相同的 CMake/CTest 入口，Linux 任务还会执行完整 `smoke.sh`。性能相关改动的提交要求见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 ## 限制
 
 - 搜索使用 IEEE 754 `double`；“零误差”表示浮点计算结果为零，不代表数学证明；
+- 每个表达式都会携带一个累计舍入误差上界。误差已经达到自身量级的值（没有任何有效位）不进入搜索空间：`sin(pi)` 求值为 1.22e-16 而真值是 0，`sqrt(2)×sqrt(2)-2` 同理。恰好为 0 的值保留，`1-1` 确实是零；
 - 负底数的非整数幂、非法函数定义域和溢出中间值会被过滤；
 - 阶乘只接受接近非负整数且不大于 170 的输入；
-- 方程结果取决于初值、迭代次数和局部收敛情况；
+- 方程结果取决于初值、迭代次数和局部收敛情况；细化过程不会走出初始 Newton 估计给出的范围。
 - 增大 `--beam`、`--pairs` 或 `--value-bits` 会增加内存和计算时间。
 - `--result-value-bits` 只影响最终和实时结果的近等值去重，不改变搜索空间；同桶优先保留成本、节点数和深度更小的表达式。
+- 终局一元闭合和锚点扩展是常开阶段，它们扩大了默认搜索空间；同一版本内结果可复现，但与更早版本的结果列表和 `attempted`／`valid`／`kept` 计数不再逐条相同。
 
 ## 目录
 
@@ -390,14 +434,19 @@ Fates/
 ├── scripts/
 │   ├── build-pgo-linux.sh
 │   ├── build-pgo-windows.ps1
+│   ├── dev-build.ps1
 │   ├── pgo-workloads.json
 │   └── run-pgo-training.py
 ├── third_party/
 │   ├── pdqsort/
 │   └── unordered_dense/
 └── tests/
+    ├── bench_search.py
     ├── benchmark_containers.ps1
-    └── smoke.sh
+    ├── check_pgo_workloads.py
+    ├── diff_equations.py
+    ├── smoke.sh
+    └── sweep_search.py
 ```
 
 ## 许可证

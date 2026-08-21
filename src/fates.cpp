@@ -16,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <numbers>
@@ -377,6 +378,8 @@ using ConstraintState = std::uint64_t;
 struct Node {
     double value{};
     double derivative{};
+    // Bound on the accumulated rounding error of `value`.
+    double error{};
     std::uint64_t hash{};
     ConstraintState constraint_state{};
     ExprId left{kNoExpr};
@@ -394,6 +397,7 @@ struct Node {
 struct Candidate {
     double value{};
     double derivative{};
+    double error{};
     std::uint64_t hash{};
     ConstraintState constraint_state{};
     ExprId left{kNoExpr};
@@ -407,8 +411,20 @@ struct Candidate {
     bool depends_on_x{};
 };
 
-static_assert(sizeof(Node) <= 56, "Node constraint state must fit in existing tail padding");
-static_assert(sizeof(Candidate) <= 56, "Candidate constraint state must fit in existing tail padding");
+static_assert(sizeof(Node) <= 64, "Node error bound must not grow the layout past one cache line");
+static_assert(sizeof(Candidate) <= 64, "Candidate error bound must not grow the layout past one cache line");
+
+// Share of a bounded archive spent on the candidates closest to the target;
+// the remainder is spread over the value axis.  Archives that hold finished
+// expressions are the search output, so they stay biased towards the target.
+inline constexpr double kDefaultNearFraction = 0.6;
+
+// Generated layers play a second role: they are the operands of the
+// meet-in-the-middle stage.  Coverage of the value axis buys extra partners
+// there, but the dominant productive shape is still a near-target operand
+// corrected by a small partner, so the split defaults to the same value and is
+// left to `--near-fraction` for targets where coverage matters more.
+inline constexpr double kSideNearFraction = kDefaultNearFraction;
 
 struct ErrorRange {
     double lower = -std::numeric_limits<double>::infinity();
@@ -449,6 +465,7 @@ struct Config {
     unsigned threads = std::max(1U, std::thread::hardware_concurrency());
     unsigned value_bits = 42;
     unsigned result_value_bits = 48;
+    double side_near_fraction = kSideNearFraction;
     ValuePruneMode value_prune = ValuePruneMode::Bucket;
     std::size_t explore_pairs = 0;
     unsigned pareto_slots = 1;
@@ -569,6 +586,53 @@ static std::uint64_t state_bucket(double value,
         key = mix64(key ^ std::rotl(mix64(constraint_state), 17));
     }
     return key;
+}
+
+// Number of independent shards used when task results are merged into a layer
+// archive.  The count is a compile-time constant so that the surviving archive
+// depends only on the search parameters, never on `--threads`.
+inline constexpr std::size_t kMergeShards = 32;
+inline constexpr unsigned kMergeShardShift = 59;  // 64 - log2(kMergeShards)
+
+// Each shard keeps several times its proportional share of the archive budget.
+// Shards see a hash-random slice of the candidates, so the number of globally
+// best candidates landing in one shard fluctuates; the head room makes the
+// final selection see every candidate the single-collector search would have
+// kept, at the cost of a few megabytes of intermediate storage.
+inline constexpr std::size_t kShardOversample = 4;
+
+// Candidate count below which a sharded merge stays on the calling thread.
+inline constexpr std::size_t kParallelMergeThreshold = 8192;
+
+// State keys are raw value buckets on the hot path, so their high bits carry the
+// exponent rather than entropy.  Avalanche once before slicing out the shard.
+static std::size_t merge_shard_of(std::uint64_t key) {
+    return static_cast<std::size_t>(mix64(key) >> kMergeShardShift);
+}
+
+// Unit roundoff: the bound on the relative error a single correctly rounded
+// double operation introduces.
+inline constexpr double kUnitRoundoff = 0.5 * std::numeric_limits<double>::epsilon();
+
+static double rounding_error(double value) {
+    return kUnitRoundoff * std::abs(value);
+}
+
+// Digit literals are exact integers; the built-in and custom constants are
+// correctly rounded reals.
+static double atom_rounding_error(double value) {
+    if (value == std::nearbyint(value) && std::abs(value) < 9.007199254740992e15) return 0.0;
+    return rounding_error(value);
+}
+
+// An expression whose accumulated rounding error has reached its own magnitude
+// has no significant digits left.  sin(pi) evaluates to 1.22e-16 where the true
+// value is zero, and everything built on it inherits pure noise -- which is how
+// the search used to "solve" pi^inv(tan(x/e)) = sin(pi) or decorate the Dottie
+// number with sqrt(sin(pi)).  Exact zeros stay: 1-1 really is zero.
+static bool value_is_significant(double value, double error) {
+    if (value == 0.0) return true;
+    return std::isfinite(error) && std::abs(value) > error;
 }
 
 static double abs_error(double value, double target) {
@@ -747,6 +811,16 @@ static std::uint64_t candidate_shape_signature(const Candidate& candidate) {
 
 class CandidateCollector {
 public:
+    struct KeyedCandidate {
+        std::uint64_t key{};
+        Candidate candidate;
+    };
+
+    struct ShardSlot {
+        std::uint64_t hashed{};
+        std::uint32_t index{};
+    };
+
     CandidateCollector(double target,
                        unsigned value_bits,
                        std::size_t soft_cap,
@@ -754,8 +828,10 @@ public:
                        std::size_t reserve_hint = 0,
                        unsigned pareto_slots = 1,
                        std::size_t extra_cap = 0,
-                       bool parallel_sort = false)
-        : target_(target),
+                       bool parallel_sort = false,
+                       double near_fraction = kDefaultNearFraction)
+        : near_fraction_(std::clamp(near_fraction, 0.02, 1.0)),
+          target_(target),
           value_bits_(value_bits),
           soft_cap_(std::max<std::size_t>(1, soft_cap)),
           derivative_sensitive_(derivative_sensitive),
@@ -808,6 +884,66 @@ public:
         });
         return out;
     }
+
+    // Bulk insert candidates whose state keys are known to be pairwise unique,
+    // which is the case when a sharded archive gathers its shards: the shards
+    // partition the key space.  Skipping the duplicate resolution and the
+    // incremental pruning lets the selection policy run exactly once.
+    void absorb_unique(const std::vector<Candidate>& candidates,
+                       const std::vector<std::uint64_t>& keys) {
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            table_.try_emplace(keys[i], candidates[i]);
+        }
+    }
+
+    // Size the primary table once before a bulk gather.  Growing it per shard
+    // would rehash the whole table on every step.
+    void reserve_primary(std::size_t entries) {
+        if (entries > table_.size()) table_.reserve(entries);
+    }
+
+    // Drain the primary table together with the state keys, ordered by the
+    // avalanched key.  That groups the merge shards into contiguous ranges and
+    // fixes the order inside each range, so neither the merge nor the surviving
+    // archive depends on the hash container's iteration order -- both container
+    // backends produce the same search.  Ordering 16-byte slots is also cheaper
+    // than the value sort `take` performs, which the merge does not need.
+    void take_sharded(std::size_t cap,
+                      std::vector<Candidate>& candidates,
+                      std::vector<std::uint64_t>& keys,
+                      std::array<std::uint32_t, kMergeShards + 1>& offsets) {
+        prune_to(cap);
+        const std::size_t total = table_.size();
+        if (total > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::length_error("单个任务的候选数超过 32 位上限");
+        }
+        scratch_candidates_.clear();
+        scratch_candidates_.reserve(total);
+        scratch_slots_.clear();
+        scratch_slots_.reserve(total);
+        for (const auto& [key, candidate] : table_) {
+            scratch_slots_.push_back({mix64(key), static_cast<std::uint32_t>(scratch_candidates_.size())});
+            scratch_candidates_.push_back({key, candidate});
+        }
+        pdqsort(scratch_slots_.begin(), scratch_slots_.end(),
+                [](const ShardSlot& a, const ShardSlot& b) { return a.hashed < b.hashed; });
+
+        candidates.resize(total);
+        keys.resize(total);
+        std::array<std::uint32_t, kMergeShards + 1> counts{};
+        for (std::size_t position = 0; position < total; ++position) {
+            const KeyedCandidate& entry = scratch_candidates_[scratch_slots_[position].index];
+            candidates[position] = entry.candidate;
+            keys[position] = entry.key;
+            ++counts[static_cast<std::size_t>(scratch_slots_[position].hashed >> kMergeShardShift) + 1];
+        }
+        for (std::size_t shard = 0; shard < kMergeShards; ++shard) {
+            counts[shard + 1] += counts[shard];
+        }
+        offsets = counts;
+    }
+
+    std::size_t size() const { return table_.size(); }
 
     std::vector<Candidate> take_extras(std::size_t cap) {
         if (pareto_slots_ <= 1 || cap == 0) return {};
@@ -984,7 +1120,9 @@ private:
             return a.hash < b.hash;
         };
 
-        const std::size_t near_count = std::min(cap, std::max<std::size_t>(1, (cap * 3) / 5));
+        const std::size_t near_count = std::min(
+            cap, std::max<std::size_t>(1, static_cast<std::size_t>(
+                     static_cast<double>(cap) * near_fraction_)));
         // We only need the best near_count entries.  Selecting that prefix in
         // linear time and sorting the prefix produces the exact same ordered
         // survivors as sorting the whole (normally 2*cap) table.
@@ -1109,6 +1247,7 @@ private:
         }
     }
 
+    double near_fraction_{kDefaultNearFraction};
     double target_{};
     unsigned value_bits_{};
     std::size_t soft_cap_{};
@@ -1119,6 +1258,8 @@ private:
     bool parallel_sort_{};
     FastMap<std::uint64_t, Candidate> table_;
     FastMap<std::uint64_t, Candidate> extra_table_;
+    std::vector<KeyedCandidate> scratch_candidates_;
+    std::vector<ShardSlot> scratch_slots_;
 };
 
 static std::pair<std::string, std::optional<unsigned>> split_optional_cost(std::string token) {
@@ -2014,6 +2155,63 @@ static bool unary_node_is(const Node& node, UnaryKind kind) {
     return node.tag == NodeTag::Unary && node.op == static_cast<std::uint8_t>(kind);
 }
 
+// Bound on |f'(x)|, used to propagate the rounding error.
+//
+// Deliberately a bound rather than the exact slope: the exact derivative of sin
+// or cos needs a second transcendental call in the hottest loop of the search,
+// while the bound of one is tight exactly where it matters -- at a multiple of
+// pi, where the result is pure cancellation noise.  Every other case reuses
+// values the evaluation already produced.
+static double unary_slope_bound(UnaryKind kind, double x, double value) {
+    switch (kind) {
+        case UnaryKind::Neg:
+        case UnaryKind::Abs:
+            return 1.0;
+        case UnaryKind::Inv: return value * value;
+        case UnaryKind::Sqrt: return value == 0.0 ? 0.0 : 0.5 / value;
+        case UnaryKind::Cbrt: return value == 0.0 ? 0.0 : 1.0 / (3.0 * value * value);
+        case UnaryKind::Sqr: return 2.0 * std::abs(x);
+        case UnaryKind::Cube: return 3.0 * x * x;
+        case UnaryKind::Ln:
+        case UnaryKind::Log10: {
+            const double slope = x == 0.0 ? 0.0 : 1.0 / std::abs(x);
+            return kind == UnaryKind::Ln ? slope : slope / std::numbers::ln10_v<double>;
+        }
+        case UnaryKind::Exp: return std::abs(value);
+        case UnaryKind::Sin:
+        case UnaryKind::Cos:
+            return 1.0;
+        case UnaryKind::Tan: return 1.0 + value * value;
+        case UnaryKind::Asin:
+        case UnaryKind::Acos: {
+            const double rest = 1.0 - x * x;
+            return rest <= 0.0 ? std::numeric_limits<double>::infinity() : 1.0 / std::sqrt(rest);
+        }
+        case UnaryKind::Atan: return 1.0 / (1.0 + x * x);
+        case UnaryKind::Sinh: return std::sqrt(1.0 + value * value);
+        case UnaryKind::Cosh: {
+            const double rest = value * value - 1.0;
+            return rest <= 0.0 ? 0.0 : std::sqrt(rest);
+        }
+        case UnaryKind::Tanh: return std::abs(1.0 - value * value);
+        case UnaryKind::Asinh: return 1.0 / std::sqrt(1.0 + x * x);
+        case UnaryKind::Acosh: {
+            const double rest = x * x - 1.0;
+            return rest <= 0.0 ? std::numeric_limits<double>::infinity() : 1.0 / std::sqrt(rest);
+        }
+        case UnaryKind::Atanh: {
+            const double rest = 1.0 - x * x;
+            return rest == 0.0 ? std::numeric_limits<double>::infinity() : std::abs(1.0 / rest);
+        }
+        case UnaryKind::Gamma: return std::abs(value * digamma(x));
+        case UnaryKind::Fact: return std::abs(value * digamma(std::nearbyint(x) + 1.0));
+        default:
+            // Without a registered derivative the honest assumption is that the
+            // operation preserves the relative error.
+            return x == 0.0 ? 1.0 : std::abs(value / x);
+    }
+}
+
 static std::optional<Candidate> apply_unary(const Config& cfg,
                                              const std::vector<Node>& arena,
                                              const UnarySpec& spec,
@@ -2154,6 +2352,16 @@ static std::optional<Candidate> apply_unary(const Config& cfg,
     }
     if (!valid_numeric(value, cfg)) return std::nullopt;
 
+    double error = rounding_error(value);
+    if (child.error != 0.0) {
+        const auto custom = custom_unary_index(spec.kind);
+        const double slope = custom && extension_registry().unary_operations()[*custom].derivative
+            ? std::abs(extension_registry().unary_operations()[*custom].derivative(x, value, 1.0))
+            : unary_slope_bound(spec.kind, x, value);
+        error += slope * child.error;
+    }
+    if (!value_is_significant(value, error)) return std::nullopt;
+
     ConstraintState constraint_state = child.constraint_state;
     if (has_constraints) {
         const auto transitioned = constraint_apply_unary(
@@ -2213,6 +2421,7 @@ static std::optional<Candidate> apply_unary(const Config& cfg,
     Candidate out;
     out.value = value;
     out.derivative = derivative;
+    out.error = error;
     out.cost = total_cost;
     out.nodes = sat_u16(static_cast<unsigned>(child.nodes) + 1U);
     out.depth = sat_u16(static_cast<unsigned>(child.depth) + 1U);
@@ -2317,6 +2526,47 @@ static std::optional<Candidate> apply_binary(const Config& cfg,
     }
     if (!valid_numeric(value, cfg)) return std::nullopt;
 
+    double error = rounding_error(value);
+    if (left->error != 0.0 || right->error != 0.0) {
+        switch (spec.kind) {
+            case BinaryKind::Add:
+            case BinaryKind::Sub:
+                // Cancellation shows up on its own here: the operand errors stay
+                // while the result shrinks towards zero.
+                error += left->error + right->error;
+                break;
+            case BinaryKind::Mul:
+                error += std::abs(a) * right->error + std::abs(b) * left->error;
+                break;
+            case BinaryKind::Div:
+                error += (left->error + std::abs(value) * right->error) / std::abs(b);
+                break;
+            case BinaryKind::Pow:
+                if (a != 0.0) error += std::abs(value * b / a) * left->error;
+                if (right->error != 0.0 && a > 0.0) {
+                    error += std::abs(value * std::log(a)) * right->error;
+                }
+                break;
+            default: {
+                const auto custom = custom_binary_index(spec.kind);
+                const auto& operation = extension_registry().binary_operations()[*custom];
+                if (operation.derivative) {
+                    error += std::abs(operation.derivative(a, b, value, 1.0, 0.0)) * left->error;
+                    error += std::abs(operation.derivative(a, b, value, 0.0, 1.0)) * right->error;
+                } else {
+                    // Without a registered derivative the honest assumption is
+                    // that the operation preserves the relative error.
+                    const double relative = std::max(
+                        a == 0.0 ? 0.0 : left->error / std::abs(a),
+                        b == 0.0 ? 0.0 : right->error / std::abs(b));
+                    error += relative * std::abs(value);
+                }
+                break;
+            }
+        }
+    }
+    if (!value_is_significant(value, error)) return std::nullopt;
+
     ConstraintState constraint_state = 0;
     if (constraints_active(cfg)) {
         const auto transitioned = constraint_apply_binary(
@@ -2359,6 +2609,7 @@ static std::optional<Candidate> apply_binary(const Config& cfg,
     Candidate out;
     out.value = value;
     out.derivative = derivative;
+    out.error = error;
     out.cost = total_cost;
     out.nodes = sat_u16(static_cast<unsigned>(left->nodes) + right->nodes + 1U);
     out.depth = sat_u16(std::max(static_cast<unsigned>(left->depth), static_cast<unsigned>(right->depth)) + 1U);
@@ -2387,10 +2638,16 @@ struct GenTask {
 };
 
 struct TaskResult {
+    // `candidates` is grouped by merge shard; `shard_offsets[s]` is the first
+    // index of shard `s` and `shard_offsets[kMergeShards]` the total size.
     std::vector<Candidate> candidates;
+    std::vector<std::uint64_t> keys;
+    std::array<std::uint32_t, kMergeShards + 1> shard_offsets{};
     std::vector<Candidate> extra_candidates;
     std::uint64_t attempted{};
     std::uint64_t valid{};
+
+    std::size_t size() const { return candidates.size(); }
 };
 
 static std::optional<double> desired_right(BinaryKind kind, double left, double target) {
@@ -2493,6 +2750,93 @@ static void add_near_indices(std::vector<std::size_t>& indices,
             have_right = right < ids.size();
         }
     }
+}
+
+// Locate the first value not below `desired`, starting from `hint`.
+//
+// The pair loops walk a value-sorted outer layer and ask for the partner of
+// each element.  For every built-in operator the requested partner moves
+// monotonically along that walk, so galloping outwards from the previous answer
+// finds the next one in a couple of probes instead of a full binary search over
+// a layer that does not fit in cache.  A useless hint only costs one extra
+// doubling scan, which keeps the helper safe for custom operators too.
+static std::size_t lower_bound_hinted(const double* values,
+                                      std::size_t size,
+                                      double desired,
+                                      std::size_t lo,
+                                      std::size_t hint) {
+    if (lo >= size) return size;
+    if (hint < lo) hint = lo;
+    if (hint >= size) hint = size - 1;
+    std::size_t low = lo;
+    std::size_t high = size;
+    if (values[hint] < desired) {
+        low = hint + 1;
+        std::size_t step = 1;
+        while (low < high) {
+            const std::size_t probe = (high - low > step) ? low + step - 1 : high - 1;
+            if (values[probe] < desired) {
+                if (probe + 1 >= high) {
+                    low = high;
+                    break;
+                }
+                low = probe + 1;
+                step <<= 1U;
+            } else {
+                high = probe;
+                break;
+            }
+        }
+    } else {
+        high = hint;
+        std::size_t step = 1;
+        while (high > low) {
+            const std::size_t probe = (high - low > step) ? high - step : low;
+            if (values[probe] < desired) {
+                low = probe + 1;
+                break;
+            }
+            high = probe;
+            if (probe == low) break;
+            step <<= 1U;
+        }
+    }
+    return static_cast<std::size_t>(std::lower_bound(values + low, values + high, desired) - values);
+}
+
+// Contiguous window of `count` entries centred on `desired`.  `hint` is read and
+// updated so consecutive calls along a monotone walk stay O(1).
+struct ValueWindow {
+    std::size_t begin{};
+    std::size_t end{};
+
+    std::size_t size() const { return end - begin; }
+};
+
+static ValueWindow value_window(const double* values,
+                                std::size_t size,
+                                double desired,
+                                std::size_t lower_limit,
+                                std::size_t count,
+                                std::size_t& hint) {
+    if (!std::isfinite(desired) || lower_limit >= size || count == 0) return {};
+    const std::size_t position = lower_bound_hinted(values, size, desired, lower_limit, hint);
+    hint = position;
+    const std::size_t before = count / 2;
+    const std::size_t begin = position > lower_limit + before ? position - before : lower_limit;
+    const std::size_t after = count - before;
+    return {begin, std::min(size, position + after)};
+}
+
+static void add_window_indices(std::vector<std::size_t>& indices,
+                               const double* values,
+                               std::size_t size,
+                               double desired,
+                               std::size_t lower_limit,
+                               std::size_t count,
+                               std::size_t& hint) {
+    const ValueWindow window = value_window(values, size, desired, lower_limit, count, hint);
+    for (std::size_t index = window.begin; index < window.end; ++index) indices.push_back(index);
 }
 
 static void add_window_indices(std::vector<std::size_t>& indices,
@@ -2618,6 +2962,253 @@ struct CostStats {
     double seconds{};
 };
 
+// Bounded layer archive that absorbs task output in parallel.
+//
+// Merging every task result into a single collector used to be the serial
+// bottleneck of the search: a cost layer routinely produces a million
+// candidates that compete for a few thousand survivors, and the whole
+// competition ran on the calling thread.  Routing candidates to a fixed number
+// of shards by their state key lets the competition run on every worker while
+// keeping the surviving archive a function of the search parameters alone --
+// the shard count is a compile-time constant and each shard consumes the task
+// results in task order, so `--threads` never changes the outcome.
+class ShardedArchive {
+public:
+    // `expected_candidates` hints at the total volume the archive will absorb.
+    // Without it every shard reserves its full budget up front, which dominates
+    // the cost of the many small layers a search also produces.
+    ShardedArchive(double target,
+                   unsigned value_bits,
+                   std::size_t soft_cap,
+                   bool derivative_sensitive,
+                   unsigned pareto_slots,
+                   std::size_t extra_cap,
+                   std::size_t expected_candidates = 0,
+                   double near_fraction = kDefaultNearFraction)
+        : near_fraction_(near_fraction),
+          target_(target),
+          value_bits_(value_bits),
+          soft_cap_(std::max<std::size_t>(1, soft_cap)),
+          derivative_sensitive_(derivative_sensitive),
+          pareto_slots_(std::max(1U, pareto_slots)),
+          extra_cap_(extra_cap) {
+        // Shards hold an over-provisioned slice of the budget with a floor, so
+        // small layers keep behaving like the single-collector search.
+        shard_cap_ = std::min(
+            soft_cap_,
+            std::max<std::size_t>(64, kShardOversample * ((soft_cap_ + kMergeShards - 1) / kMergeShards)));
+        shard_extra_ =
+            pareto_slots_ <= 1
+                ? 0
+                : std::max<std::size_t>(8, kShardOversample *
+                                               ((extra_cap_ + kMergeShards - 1) / kMergeShards));
+        const std::size_t shard_reserve = std::clamp<std::size_t>(
+            expected_candidates == 0 ? 128 : (expected_candidates / kMergeShards) + 8,
+            32, shard_cap_ * 2 + 1);
+        shards_.reserve(kMergeShards);
+        for (std::size_t shard = 0; shard < kMergeShards; ++shard) {
+            shards_.emplace_back(target_, value_bits_, shard_cap_, derivative_sensitive_,
+                                 shard_reserve, pareto_slots_, shard_extra_, false,
+                                 near_fraction_);
+        }
+    }
+
+    void consider_with_key(const Candidate& candidate, std::uint64_t key) {
+        shards_[merge_shard_of(key)].consider_with_key(candidate, key);
+    }
+
+    void consider(const Candidate& candidate) {
+        const auto key = state_bucket(candidate.value, candidate.derivative, candidate.depends_on_x,
+                                      candidate.constraint_state, value_bits_, derivative_sensitive_);
+        consider_with_key(candidate, key);
+    }
+
+    void consider_extra_only(const Candidate& candidate) {
+        if (pareto_slots_ <= 1) return;
+        const auto key = state_bucket(candidate.value, candidate.derivative, candidate.depends_on_x,
+                                      candidate.constraint_state, value_bits_, derivative_sensitive_);
+        shards_[merge_shard_of(key)].consider_extra_only(candidate);
+    }
+
+    // Absorb one shard of every listed task result.  Callers drive the executor
+    // so that several archives can be merged inside a single dispatch.
+    void absorb_shard(const std::vector<TaskResult>& results,
+                      const std::vector<std::uint32_t>& task_indices,
+                      std::size_t shard) {
+        CandidateCollector& sink = shards_[shard];
+        for (const std::uint32_t index : task_indices) {
+            const TaskResult& result = results[index];
+            const std::uint32_t begin = result.shard_offsets[shard];
+            const std::uint32_t end = result.shard_offsets[shard + 1];
+            for (std::uint32_t i = begin; i < end; ++i) {
+                sink.consider_with_key(result.candidates[i], result.keys[i]);
+            }
+        }
+    }
+
+    void absorb_shard(const std::vector<TaskResult>& results, std::size_t shard) {
+        CandidateCollector& sink = shards_[shard];
+        for (const TaskResult& result : results) {
+            const std::uint32_t begin = result.shard_offsets[shard];
+            const std::uint32_t end = result.shard_offsets[shard + 1];
+            for (std::uint32_t i = begin; i < end; ++i) {
+                sink.consider_with_key(result.candidates[i], result.keys[i]);
+            }
+        }
+    }
+
+    // Merge every shard of every task result.  Waking the worker pool costs
+    // more than the merge itself on the many small layers a search produces, so
+    // small batches stay on the calling thread.
+    void absorb(const std::vector<TaskResult>& results, ParallelExecutor& executor) {
+        std::size_t total = 0;
+        for (const TaskResult& result : results) total += result.candidates.size();
+        if (total < kParallelMergeThreshold) {
+            for (std::size_t shard = 0; shard < kMergeShards; ++shard) absorb_shard(results, shard);
+        } else {
+            executor.run(kMergeShards, [&](std::size_t shard) { absorb_shard(results, shard); });
+        }
+        absorb_extras(results);
+    }
+
+    void absorb_extras(const std::vector<TaskResult>& results) {
+        if (pareto_slots_ <= 1) return;
+        for (const TaskResult& result : results) {
+            for (const Candidate& candidate : result.extra_candidates) consider_extra_only(candidate);
+        }
+    }
+
+    // Reduce every shard to its survivors in parallel.  Optional: `take` falls
+    // back to doing the same work serially when no executor is available.
+    void prepare(ParallelExecutor& executor) {
+        if (prepared_ || final_) return;
+        std::size_t total = 0;
+        for (const CandidateCollector& shard : shards_) total += shard.size();
+        drained_.resize(kMergeShards);
+        if (total < kParallelMergeThreshold) {
+            for (std::size_t shard = 0; shard < kMergeShards; ++shard) drain_shard(shard);
+        } else {
+            executor.run(kMergeShards, [&](std::size_t shard) { drain_shard(shard); });
+        }
+        prepared_ = true;
+    }
+
+    std::vector<Candidate> take(std::size_t cap) {
+        finalize();
+        return final_->take(cap);
+    }
+
+    std::vector<Candidate> take_extras(std::size_t cap) {
+        finalize();
+        return final_->take_extras(cap);
+    }
+
+private:
+    struct DrainedShard {
+        std::vector<Candidate> candidates;
+        std::vector<std::uint64_t> keys;
+        std::vector<Candidate> extras;
+    };
+
+    void drain_shard(std::size_t shard) {
+        std::array<std::uint32_t, kMergeShards + 1> offsets{};
+        DrainedShard& out = drained_[shard];
+        shards_[shard].take_sharded(shard_cap_, out.candidates, out.keys, offsets);
+        if (pareto_slots_ > 1) out.extras = shards_[shard].take_extras(shard_extra_);
+    }
+
+    void finalize() {
+        if (final_) return;
+        if (!prepared_) {
+            drained_.resize(kMergeShards);
+            for (std::size_t shard = 0; shard < kMergeShards; ++shard) drain_shard(shard);
+            prepared_ = true;
+        }
+        std::size_t gathered = 0;
+        for (const DrainedShard& shard : drained_) gathered += shard.candidates.size();
+        final_.emplace(target_, value_bits_, soft_cap_, derivative_sensitive_, 0, pareto_slots_,
+                       extra_cap_, false, near_fraction_);
+        final_->reserve_primary(gathered + 1);
+        for (DrainedShard& shard : drained_) {
+            final_->absorb_unique(shard.candidates, shard.keys);
+            if (pareto_slots_ > 1) {
+                for (const Candidate& candidate : shard.extras) final_->consider_extra_only(candidate);
+            }
+        }
+        drained_.clear();
+        drained_.shrink_to_fit();
+        shards_.clear();
+        shards_.shrink_to_fit();
+    }
+
+    double near_fraction_{kDefaultNearFraction};
+    double target_{};
+    unsigned value_bits_{};
+    std::size_t soft_cap_{};
+    bool derivative_sensitive_{};
+    unsigned pareto_slots_{1};
+    std::size_t extra_cap_{};
+    std::size_t shard_cap_{};
+    std::size_t shard_extra_{};
+    std::vector<CandidateCollector> shards_;
+    std::vector<DrainedShard> drained_;
+    std::optional<CandidateCollector> final_;
+    bool prepared_{false};
+};
+
+// Per-cost archives for the stages that emit expressions at several total costs
+// at once.  Slots are created on demand; callers that merge in parallel must
+// touch every cost they need beforehand.
+class CostArchives {
+public:
+    CostArchives(unsigned max_cost,
+                 double target,
+                 unsigned value_bits,
+                 std::size_t soft_cap,
+                 unsigned pareto_slots,
+                 std::size_t extra_cap,
+                 double near_fraction)
+        : near_fraction_(near_fraction),
+          target_(target),
+          value_bits_(value_bits),
+          soft_cap_(soft_cap),
+          pareto_slots_(pareto_slots),
+          extra_cap_(extra_cap),
+          slots_(static_cast<std::size_t>(max_cost) + 1),
+          hints_(static_cast<std::size_t>(max_cost) + 1) {}
+
+    // Volume hint per cost, consumed when the slot is first created.
+    void add_expected(unsigned cost, std::uint64_t expected_candidates) {
+        if (cost >= hints_.size()) return;
+        constexpr std::uint64_t ceiling = 1ULL << 30U;
+        hints_[cost] = static_cast<std::size_t>(
+            std::min<std::uint64_t>(ceiling, hints_[cost] + expected_candidates));
+    }
+
+    ShardedArchive& at(unsigned cost) {
+        std::unique_ptr<ShardedArchive>& slot = slots_[cost];
+        if (!slot) {
+            slot = std::make_unique<ShardedArchive>(target_, value_bits_, soft_cap_, false,
+                                                    pareto_slots_, extra_cap_, hints_[cost],
+                                                    near_fraction_);
+        }
+        return *slot;
+    }
+
+    bool has(unsigned cost) const { return cost < slots_.size() && slots_[cost] != nullptr; }
+    unsigned max_cost() const { return static_cast<unsigned>(slots_.size()) - 1U; }
+
+private:
+    double near_fraction_{kDefaultNearFraction};
+    double target_{};
+    unsigned value_bits_{};
+    std::size_t soft_cap_{};
+    unsigned pareto_slots_{1};
+    std::size_t extra_cap_{};
+    std::vector<std::unique_ptr<ShardedArchive>> slots_;
+    std::vector<std::size_t> hints_;
+};
+
 struct SearchStats {
     std::vector<CostStats> by_cost;
     std::uint64_t attempted{};
@@ -2628,6 +3219,10 @@ struct SearchStats {
     unsigned completed_cost{};
     unsigned generated_cost{};
     bool used_mitm{};
+    bool used_unary_closure{};
+    std::size_t unary_closure_candidates{};
+    bool used_anchor_extension{};
+    std::size_t anchor_extension_candidates{};
     bool used_inverse_templates{};
     bool used_deep_compositions{};
     bool used_exploration{};
@@ -2895,6 +3490,7 @@ public:
           executor_(cfg_.threads),
           atoms_(build_atoms(cfg_)),
           layers_(cfg_.max_cost + 1),
+          layer_values_(cfg_.max_cost + 1),
           extra_layers_(cfg_.max_cost + 1),
           stats_{std::vector<CostStats>(cfg_.max_cost + 1)} {
         cfg_.symbol_constraints = compile_symbol_constraints(cfg_, atoms_);
@@ -2934,6 +3530,7 @@ public:
                       << "  \"deep_frontier\": " << cfg_.deep_frontier << ",\n"
                       << "  \"threads\": " << cfg_.threads << ",\n"
                       << "  \"value_bits\": " << cfg_.value_bits << ",\n"
+                      << "  \"near_fraction\": " << cfg_.side_near_fraction << ",\n"
                       << "  \"result_value_bits\": " << cfg_.result_value_bits << ",\n"
                       << "  \"value_prune\": \"" << value_prune_mode_name(cfg_.value_prune) << "\",\n"
                       << "  \"explore_pairs\": " << cfg_.explore_pairs << ",\n"
@@ -2983,6 +3580,8 @@ public:
                   << "  Result value bits : " << cfg_.result_value_bits << '\n'
                   << "  Value pruning     : " << value_prune_mode_name(cfg_.value_prune)
                   << " (effective bits " << state_value_bits(cfg_) << ")\n"
+                  << "  Near fraction     : " << std::setprecision(4) << cfg_.side_near_fraction
+                  << " of each layer\n" << std::setprecision(17)
                   << "  Equation policy   : " << equation_search_mode_name(cfg_.equation_search)
                   << " / " << equation_quality_mode_name(cfg_.equation_quality) << '\n'
                   << "  Explore pairs     : " << cfg_.explore_pairs << " / outer candidate\n"
@@ -3032,9 +3631,12 @@ public:
                 if (cfg_.live && !cfg_.equations) live_reporter.consider_batch(task_results[i].candidates, cost);
             });
 
-            CandidateCollector global(cfg_.target, state_value_bits(cfg_),
-                                      std::max<std::size_t>(cfg_.beam * 3, 256), cfg_.equations, 0,
-                                      cfg_.pareto_slots, pareto_extra_cap(), true);
+            std::size_t produced = atoms_.size();
+            for (const auto& result : task_results) produced += result.candidates.size();
+            ShardedArchive global(cfg_.target, state_value_bits(cfg_),
+                                  std::max<std::size_t>(cfg_.beam * 3, 256), cfg_.equations,
+                                  cfg_.pareto_slots, pareto_extra_cap(), produced,
+                                  cfg_.side_near_fraction);
             std::vector<Candidate> atom_candidates;
             for (std::uint32_t atom_index = 0; atom_index < atoms_.size(); ++atom_index) {
                 const AtomSpec& atom = atoms_[atom_index];
@@ -3044,6 +3646,7 @@ public:
                 Candidate candidate;
                 candidate.value = atom.value;
                 candidate.derivative = atom.variable ? 1.0 : 0.0;
+                candidate.error = atom.variable ? 0.0 : atom_rounding_error(atom.value);
                 candidate.cost = atom.cost;
                 candidate.nodes = 1;
                 candidate.depth = 1;
@@ -3068,20 +3671,12 @@ public:
                 cs.attempted = saturating_add(cs.attempted, result.attempted);
                 cs.valid = saturating_add(cs.valid, result.valid);
                 cs.task_candidates += result.candidates.size();
-                for (const auto& candidate : result.candidates) {
-                    const auto key = state_bucket(candidate.value, candidate.derivative, candidate.depends_on_x,
-                                                  candidate.constraint_state, state_value_bits(cfg_), cfg_.equations);
-                    if (!has_seen_state(key)) {
-                        global.consider_with_key(candidate, key);
-                    } else {
-                        global.consider_extra_only(candidate);
-                    }
-                }
-                for (const auto& candidate : result.extra_candidates) {
-                    global.consider_extra_only(candidate);
-                }
             }
+            // Tasks already rejected states that earlier cost layers own, so the
+            // merge only has to distribute the survivors across the shards.
+            global.absorb(task_results, executor_);
 
+            global.prepare(executor_);
             auto survivors = global.take(cfg_.beam);
             auto extra_survivors = global.take_extras(pareto_extra_cap());
             auto& layer = layers_[cost];
@@ -3096,6 +3691,7 @@ public:
                 if (arena_[a].value != arena_[b].value) return arena_[a].value < arena_[b].value;
                 return arena_[a].hash < arena_[b].hash;
             });
+            refresh_layer_values(cost);
             auto& extra_layer = extra_layers_[cost];
             std::sort(extra_layer.begin(), extra_layer.end(), [&](ExprId a, ExprId b) {
                 if (arena_[a].value != arena_[b].value) return arena_[a].value < arena_[b].value;
@@ -3306,6 +3902,7 @@ private:
         Node node;
         node.value = candidate.value;
         node.derivative = candidate.derivative;
+        node.error = candidate.error;
         node.cost = candidate.cost;
         node.nodes = candidate.nodes;
         node.depth = candidate.depth;
@@ -3578,6 +4175,7 @@ private:
         Candidate candidate;
         candidate.value = node.value;
         candidate.derivative = node.derivative;
+        candidate.error = node.error;
         candidate.cost = node.cost;
         candidate.nodes = node.nodes;
         candidate.depth = node.depth;
@@ -3682,6 +4280,15 @@ private:
         return id;
     }
 
+    void refresh_layer_values(unsigned cost) {
+        const auto& ids = layers_[cost];
+        auto& values = layer_values_[cost];
+        values.resize(ids.size());
+        for (std::size_t index = 0; index < ids.size(); ++index) {
+            values[index] = arena_[ids[index]].value;
+        }
+    }
+
     void sort_touched_layers(const std::vector<unsigned char>& touched_cost) {
         for (unsigned cost = 1; cost < layers_.size(); ++cost) {
             if (!touched_cost[cost]) continue;
@@ -3693,6 +4300,7 @@ private:
                 return a < b;
             });
             ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+            refresh_layer_values(cost);
             stats_.by_cost[cost].kept = ids.size();
         }
     }
@@ -3959,7 +4567,7 @@ private:
         }
     }
 
-    void run_deep_unbalanced_mitm(std::map<unsigned, CandidateCollector>& collectors,
+    void run_deep_unbalanced_mitm(CostArchives& archives,
                                   unsigned side_cost,
                                   FastMap<std::uint64_t, ExprId>& auxiliary_ids) {
         struct TopRequest {
@@ -4133,17 +4741,12 @@ private:
                 if (!final_candidate) continue;
                 ++stats_.valid;
                 ++stats_.by_cost[total_cost].valid;
-                auto [collector_it, _] = collectors.try_emplace(
-                    total_cost, cfg_.target, state_value_bits(cfg_),
-                    std::max<std::size_t>(cfg_.beam * 3, 256), false, 0,
-                    cfg_.pareto_slots, pareto_extra_cap());
-                collector_it->second.consider(*final_candidate);
+                archives.at(total_cost).consider(*final_candidate);
             }
         }
     }
 
-    void run_unbalanced_mitm(std::map<unsigned, CandidateCollector>& collectors,
-                             unsigned side_cost) {
+    void run_unbalanced_mitm(CostArchives& archives, unsigned side_cost) {
         if (layers_.size() <= 1 || layers_[1].empty()) return;
         const auto& anchors = layers_[1];
         FastMap<std::uint64_t, ExprId> auxiliary_ids;
@@ -4222,21 +4825,54 @@ private:
                         if (!final_candidate) continue;
                         ++stats_.valid;
                         ++stats_.by_cost[total_cost].valid;
-                        auto [collector_it, _] = collectors.try_emplace(
-                            total_cost, cfg_.target, state_value_bits(cfg_),
-                            std::max<std::size_t>(cfg_.beam * 3, 256), false, 0,
-                            cfg_.pareto_slots, pareto_extra_cap());
-                        collector_it->second.consider(*final_candidate);
+                        archives.at(total_cost).consider(*final_candidate);
                     }
                 }
             }
         }
-        run_deep_unbalanced_mitm(collectors, side_cost, auxiliary_ids);
+        run_deep_unbalanced_mitm(archives, side_cost, auxiliary_ids);
     }
 
-    void run_terminal_mitm(LiveTopReporter& live_reporter, unsigned side_cost) {
-        std::map<unsigned, CandidateCollector> collectors;
+    // Upper bound on the candidates a task can emit, mirroring the reserve
+    // estimate inside `process_task`.  Used to keep the amount of task output
+    // held in flight during the meet-in-the-middle stage bounded.
+    std::uint64_t task_candidate_bound(const GenTask& task) const {
+        const std::uint64_t outer_count = task.end - task.begin;
+        std::uint64_t bound = outer_count;
+        if (task.type == GenTask::Type::Binary) {
+            if (task.full) {
+                const auto inner_cost = task.reverse ? task.left_cost : task.right_cost;
+                bound = saturating_mul(outer_count, layers_[inner_cost].size());
+            } else {
+                std::uint64_t per_outer = saturating_add(task.samples_per_outer, 5);
+                per_outer = saturating_add(per_outer, cfg_.explore_pairs);
+                if (!task.reverse && binary_ops_[task.op_index].kind == BinaryKind::Pow) {
+                    per_outer = saturating_add(per_outer, 8U * 5U);
+                }
+                bound = saturating_mul(outer_count, per_outer);
+            }
+        }
+        return std::min<std::uint64_t>(bound, std::max<std::size_t>(cfg_.beam, 256));
+    }
 
+    // One partition direction of the meet-in-the-middle stage together with the
+    // contiguous range of tasks that covers it.
+    struct MitmSlice {
+        std::uint16_t total_cost{};
+        std::uint32_t task_begin{};
+        std::uint32_t task_end{};
+    };
+
+    void run_terminal_mitm(LiveTopReporter& live_reporter, unsigned side_cost) {
+        CostArchives archives(cfg_.max_cost, cfg_.target, state_value_bits(cfg_),
+                              std::max<std::size_t>(cfg_.beam * 3, 256), cfg_.pareto_slots,
+                              pareto_extra_cap(), kDefaultNearFraction);
+
+        // Enumerate every partition direction first.  The order is fixed, so the
+        // archives see the same candidate sequence no matter how the work is
+        // later batched or spread over workers.
+        std::vector<GenTask> tasks;
+        std::vector<MitmSlice> slices;
         for (std::size_t op_index = 0; op_index < binary_ops_.size(); ++op_index) {
             const auto& op = binary_ops_[op_index];
             for (unsigned left_cost = 1; left_cost <= side_cost; ++left_cost) {
@@ -4247,25 +4883,20 @@ private:
 
                     const unsigned total_cost = left_cost + right_cost + op.cost;
                     if (total_cost <= side_cost || total_cost > cfg_.max_cost) continue;
-                    auto [collector_it, _] = collectors.try_emplace(
-                            total_cost, cfg_.target, state_value_bits(cfg_),
-                        std::max<std::size_t>(cfg_.beam * 3, 256), false, 0,
-                        cfg_.pareto_slots, pareto_extra_cap());
-                    CandidateCollector& collector = collector_it->second;
-                    const auto partition_start = std::chrono::steady_clock::now();
 
-                    const auto process_direction = [&](bool reverse) {
+                    const auto add_direction = [&](bool reverse) {
                         const auto& outer_ids = reverse ? layers_[right_cost] : layers_[left_cost];
-                        // Local collectors prune before the partition results are merged. Keep
-                        // the partition boundaries independent of worker count so identical
-                        // settings produce the same archive with any --threads value. Sixteen
-                        // chunks preserves the established default eight-worker search shape.
+                        if (outer_ids.empty()) return;
+                        // Task collectors prune before their output is merged, so the
+                        // chunk boundaries stay a function of the search parameters.
+                        // Sixteen chunks preserves the established search shape.
                         const std::size_t desired_chunks = std::max<std::size_t>(
                             1, std::min<std::size_t>(cfg_.task_chunks, 16));
                         const std::size_t chunks = std::min(outer_ids.size(), desired_chunks);
                         const std::size_t chunk_size = (outer_ids.size() + chunks - 1) / chunks;
-                        std::vector<GenTask> tasks;
-                        tasks.reserve(chunks);
+                        MitmSlice slice;
+                        slice.total_cost = static_cast<std::uint16_t>(total_cost);
+                        slice.task_begin = static_cast<std::uint32_t>(tasks.size());
                         for (std::size_t begin = 0; begin < outer_ids.size(); begin += chunk_size) {
                             tasks.push_back({GenTask::Type::Binary, op_index,
                                              static_cast<std::uint16_t>(left_cost),
@@ -4274,38 +4905,140 @@ private:
                                              is_commutative(op.kind) && left_cost == right_cost, 0,
                                              static_cast<std::uint16_t>(total_cost), reverse});
                         }
-
-                        std::vector<TaskResult> results(tasks.size());
-                        executor_.run(tasks.size(), [&](std::size_t i) {
-                            results[i] = process_task(tasks[i]);
-                        });
-
-                        CostStats& cs = stats_.by_cost[total_cost];
-                        for (const auto& result : results) {
-                            cs.attempted = saturating_add(cs.attempted, result.attempted);
-                            cs.valid = saturating_add(cs.valid, result.valid);
-                            cs.task_candidates += result.candidates.size();
-                            stats_.attempted = saturating_add(stats_.attempted, result.attempted);
-                            stats_.valid = saturating_add(stats_.valid, result.valid);
-                            if (cfg_.live) live_reporter.consider_batch(result.candidates, total_cost);
-                            for (const Candidate& candidate : result.candidates) collector.consider(candidate);
-                            for (const Candidate& candidate : result.extra_candidates) {
-                                collector.consider_extra_only(candidate);
-                            }
-                        }
+                        slice.task_end = static_cast<std::uint32_t>(tasks.size());
+                        slices.push_back(slice);
                     };
 
-                    process_direction(false);
-                    if (!is_commutative(op.kind)) process_direction(true);
-                    stats_.by_cost[total_cost].seconds +=
-                        std::chrono::duration<double>(std::chrono::steady_clock::now() - partition_start).count();
+                    add_direction(false);
+                    if (!is_commutative(op.kind)) add_direction(true);
                 }
             }
         }
 
-        run_unbalanced_mitm(collectors, side_cost);
+        for (const MitmSlice& slice : slices) {
+            std::uint64_t expected = 0;
+            for (std::uint32_t t = slice.task_begin; t < slice.task_end; ++t) {
+                expected = saturating_add(expected, task_candidate_bound(tasks[t]));
+            }
+            archives.add_expected(slice.total_cost, expected);
+        }
 
-        for (auto& [cost, collector] : collectors) {
+        // Generation and merging each get one wide dispatch per batch.  Batches
+        // exist only to bound peak memory: every archive keeps consuming task
+        // output in slice order across batch boundaries.
+        constexpr std::uint64_t kBatchBytes = 96ULL << 20U;
+        const std::uint64_t bytes_per_candidate = sizeof(Candidate) + sizeof(std::uint64_t);
+        std::vector<TaskResult> results;
+        std::vector<unsigned> batch_costs;
+        std::vector<std::vector<std::uint32_t>> batch_cost_tasks;
+        std::vector<ShardedArchive*> batch_archives;
+        std::size_t slice_index = 0;
+        while (slice_index < slices.size()) {
+            const auto batch_start = std::chrono::steady_clock::now();
+            const std::size_t first_task = slices[slice_index].task_begin;
+            std::size_t last_task = first_task;
+            std::uint64_t batch_bytes = 0;
+            const std::size_t batch_first_slice = slice_index;
+            while (slice_index < slices.size()) {
+                const MitmSlice& slice = slices[slice_index];
+                std::uint64_t slice_bytes = 0;
+                for (std::uint32_t t = slice.task_begin; t < slice.task_end; ++t) {
+                    slice_bytes = saturating_add(
+                        slice_bytes,
+                        saturating_mul(task_candidate_bound(tasks[t]), bytes_per_candidate));
+                }
+                if (batch_bytes != 0 && saturating_add(batch_bytes, slice_bytes) > kBatchBytes) break;
+                batch_bytes = saturating_add(batch_bytes, slice_bytes);
+                last_task = slice.task_end;
+                ++slice_index;
+            }
+
+            const std::size_t batch_tasks = last_task - first_task;
+            results.assign(batch_tasks, TaskResult{});
+            executor_.run(batch_tasks, [&](std::size_t i) {
+                results[i] = process_task(tasks[first_task + i]);
+            });
+
+            batch_costs.clear();
+            batch_cost_tasks.clear();
+            batch_archives.clear();
+            for (std::size_t index = batch_first_slice; index < slice_index; ++index) {
+                const MitmSlice& slice = slices[index];
+                const auto found = std::find(batch_costs.begin(), batch_costs.end(), slice.total_cost);
+                std::size_t position = static_cast<std::size_t>(found - batch_costs.begin());
+                if (found == batch_costs.end()) {
+                    batch_costs.push_back(slice.total_cost);
+                    batch_cost_tasks.emplace_back();
+                    position = batch_costs.size() - 1;
+                }
+                for (std::uint32_t t = slice.task_begin; t < slice.task_end; ++t) {
+                    batch_cost_tasks[position].push_back(static_cast<std::uint32_t>(t - first_task));
+                }
+            }
+            // Create every archive the batch needs before the parallel merge.
+            for (const unsigned cost : batch_costs) batch_archives.push_back(&archives.at(cost));
+
+            for (std::size_t i = 0; i < batch_tasks; ++i) {
+                const GenTask& task = tasks[first_task + i];
+                const TaskResult& result = results[i];
+                CostStats& cs = stats_.by_cost[task.total_cost];
+                cs.attempted = saturating_add(cs.attempted, result.attempted);
+                cs.valid = saturating_add(cs.valid, result.valid);
+                cs.task_candidates += result.candidates.size();
+                stats_.attempted = saturating_add(stats_.attempted, result.attempted);
+                stats_.valid = saturating_add(stats_.valid, result.valid);
+                if (cfg_.live) live_reporter.consider_batch(result.candidates, task.total_cost);
+            }
+
+            std::size_t batch_candidates = 0;
+            for (const TaskResult& result : results) batch_candidates += result.candidates.size();
+            const auto merge_unit = [&](std::size_t unit) {
+                const std::size_t cost_index = unit / kMergeShards;
+                const std::size_t shard = unit % kMergeShards;
+                batch_archives[cost_index]->absorb_shard(results, batch_cost_tasks[cost_index], shard);
+            };
+            const std::size_t merge_units = batch_archives.size() * kMergeShards;
+            if (batch_candidates < kParallelMergeThreshold) {
+                for (std::size_t unit = 0; unit < merge_units; ++unit) merge_unit(unit);
+            } else {
+                executor_.run(merge_units, merge_unit);
+            }
+            if (cfg_.pareto_slots > 1) {
+                for (std::size_t index = 0; index < batch_archives.size(); ++index) {
+                    for (const std::uint32_t task_index : batch_cost_tasks[index]) {
+                        for (const Candidate& candidate : results[task_index].extra_candidates) {
+                            batch_archives[index]->consider_extra_only(candidate);
+                        }
+                    }
+                }
+            }
+
+            const double batch_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - batch_start).count();
+            if (!batch_costs.empty()) {
+                const double share = batch_seconds / static_cast<double>(batch_costs.size());
+                for (const unsigned cost : batch_costs) stats_.by_cost[cost].seconds += share;
+            }
+        }
+        results.clear();
+        results.shrink_to_fit();
+
+        run_unbalanced_mitm(archives, side_cost);
+
+        for (unsigned cost = 1; cost <= cfg_.max_cost; ++cost) {
+            // Above the generated side cost the partition sweep only builds
+            // expressions whose root is a binary operator, so closing the
+            // finished layers under the unary operators is what restores shapes
+            // such as sqrt(a+b+c) whose argument is already too expensive to be
+            // a meet-in-the-middle side.  Costs are finalized in ascending
+            // order, so chains of unary operators are covered as well.
+            if (cost > side_cost) {
+                absorb_anchor_extension(archives, cost, side_cost, live_reporter);
+                absorb_unary_closure(archives, cost, live_reporter);
+            }
+            if (!archives.has(cost)) continue;
+            ShardedArchive& collector = archives.at(cost);
+            collector.prepare(executor_);
             auto survivors = collector.take(cfg_.beam);
             auto extra_survivors = collector.take_extras(pareto_extra_cap());
             if (cfg_.live) live_reporter.consider_batch(survivors, cost);
@@ -4319,6 +5052,7 @@ private:
                 Node node;
                 node.value = candidate.value;
                 node.derivative = candidate.derivative;
+                node.error = candidate.error;
                 node.cost = candidate.cost;
                 node.nodes = candidate.nodes;
                 node.depth = candidate.depth;
@@ -4341,6 +5075,7 @@ private:
                 if (arena_[a].value != arena_[b].value) return arena_[a].value < arena_[b].value;
                 return arena_[a].hash < arena_[b].hash;
             });
+            refresh_layer_values(cost);
             auto& extra_layer = extra_layers_[cost];
             std::sort(extra_layer.begin(), extra_layer.end(), [&](ExprId a, ExprId b) {
                 if (arena_[a].value != arena_[b].value) return arena_[a].value < arena_[b].value;
@@ -4350,6 +5085,119 @@ private:
             stats_.kept += layer.size();
         }
         if (cfg_.live) live_reporter.snapshot(cfg_.max_cost);
+    }
+
+    // Run a task list and merge its output into the archive of `cost`.
+    void absorb_terminal_tasks(CostArchives& archives,
+                               unsigned cost,
+                               const std::vector<GenTask>& tasks,
+                               LiveTopReporter& live_reporter,
+                               std::size_t* candidate_counter) {
+        if (tasks.empty()) return;
+        std::vector<TaskResult> results(tasks.size());
+        executor_.run(tasks.size(), [&](std::size_t i) { results[i] = process_task(tasks[i]); });
+
+        std::uint64_t expected = 0;
+        for (const GenTask& task : tasks) {
+            expected = saturating_add(expected, task_candidate_bound(task));
+        }
+        archives.add_expected(cost, expected);
+        ShardedArchive& archive = archives.at(cost);
+
+        CostStats& cs = stats_.by_cost[cost];
+        for (const TaskResult& result : results) {
+            cs.attempted = saturating_add(cs.attempted, result.attempted);
+            cs.valid = saturating_add(cs.valid, result.valid);
+            cs.task_candidates += result.candidates.size();
+            stats_.attempted = saturating_add(stats_.attempted, result.attempted);
+            stats_.valid = saturating_add(stats_.valid, result.valid);
+            if (candidate_counter != nullptr) *candidate_counter += result.candidates.size();
+            if (cfg_.live) live_reporter.consider_batch(result.candidates, cost);
+        }
+        archive.absorb(results, executor_);
+    }
+
+    // Apply every unary operator to the finished layers that can reach `cost`
+    // and merge the results into that cost's archive.  Linear in the archive
+    // size, so it is affordable on every search rather than an opt-in stage.
+    void absorb_unary_closure(CostArchives& archives, unsigned cost,
+                              LiveTopReporter& live_reporter) {
+        if (unary_ops_.empty()) return;
+        std::vector<GenTask> tasks;
+        const std::size_t base_chunks = std::max<std::size_t>(1, cfg_.task_chunks);
+        for (std::size_t op_index = 0; op_index < unary_ops_.size(); ++op_index) {
+            const auto& op = unary_ops_[op_index];
+            if (op.cost == 0 || op.cost >= cost) continue;
+            const unsigned child_cost = cost - op.cost;
+            if (child_cost >= layers_.size()) continue;
+            const auto& ids = layers_[child_cost];
+            if (ids.empty()) continue;
+            const std::size_t chunks = std::min(ids.size(), base_chunks);
+            const std::size_t chunk_size = (ids.size() + chunks - 1) / chunks;
+            for (std::size_t begin = 0; begin < ids.size(); begin += chunk_size) {
+                tasks.push_back({GenTask::Type::Unary, op_index,
+                                 static_cast<std::uint16_t>(child_cost), 0, begin,
+                                 std::min(ids.size(), begin + chunk_size), true, false, 1,
+                                 static_cast<std::uint16_t>(cost)});
+            }
+        }
+        if (tasks.empty()) return;
+        absorb_terminal_tasks(archives, cost, tasks, live_reporter,
+                              &stats_.unary_closure_candidates);
+        stats_.used_unary_closure = true;
+    }
+
+    // Extend a finished layer with a cheap partner.
+    //
+    // The partition sweep combines two generated operands, so a tree that puts
+    // almost all of its cost on one side -- 9*(9-e)*(pi+6)+4, say -- is out of
+    // its reach: the expensive operand was never a candidate side.  Once a layer
+    // above the side cost is final it can play that role itself.  For a cheap
+    // anchor the target fixes the value the expensive operand has to take, so
+    // each anchor costs one window lookup.  Costs are finalized in ascending
+    // order, which also composes the extension into left-leaning chains.
+    void absorb_anchor_extension(CostArchives& archives, unsigned cost, unsigned side_cost,
+                                 LiveTopReporter& live_reporter) {
+        if (binary_ops_.empty()) return;
+        // Cheap anchors are the point of the stage; the budget stops it from
+        // turning into a second full partition sweep on wide beams.
+        const std::size_t anchor_budget = std::max<std::size_t>(2048, cfg_.beam);
+        const std::size_t base_chunks = std::max<std::size_t>(1, cfg_.task_chunks);
+        std::vector<GenTask> tasks;
+        for (std::size_t op_index = 0; op_index < binary_ops_.size(); ++op_index) {
+            const auto& op = binary_ops_[op_index];
+            std::size_t spent = 0;
+            for (unsigned anchor_cost = 1; anchor_cost <= side_cost; ++anchor_cost) {
+                if (anchor_cost + op.cost + side_cost >= cost) break;
+                const unsigned base_cost = cost - anchor_cost - op.cost;
+                if (base_cost >= layers_.size()) continue;
+                const auto& anchors = layers_[anchor_cost];
+                if (anchors.empty() || layers_[base_cost].empty()) continue;
+                if (spent != 0 && spent + anchors.size() > anchor_budget) break;
+                spent += anchors.size();
+
+                const std::size_t chunks = std::min(anchors.size(), base_chunks);
+                const std::size_t chunk_size = (anchors.size() + chunks - 1) / chunks;
+                const auto add_direction = [&](bool anchor_on_left) {
+                    const std::uint16_t left_cost = static_cast<std::uint16_t>(
+                        anchor_on_left ? anchor_cost : base_cost);
+                    const std::uint16_t right_cost = static_cast<std::uint16_t>(
+                        anchor_on_left ? base_cost : anchor_cost);
+                    for (std::size_t begin = 0; begin < anchors.size(); begin += chunk_size) {
+                        tasks.push_back({GenTask::Type::Binary, op_index, left_cost, right_cost,
+                                         begin, std::min(anchors.size(), begin + chunk_size), false,
+                                         false, 0, static_cast<std::uint16_t>(cost),
+                                         !anchor_on_left});
+                    }
+                };
+                add_direction(true);
+                if (!is_commutative(op.kind)) add_direction(false);
+            }
+        }
+        if (tasks.empty()) return;
+        absorb_terminal_tasks(archives, cost, tasks, live_reporter,
+                              &stats_.anchor_extension_candidates);
+        stats_.used_anchor_extension = true;
     }
 
     TaskResult process_deep_slice(const BinarySpec& op,
@@ -4410,7 +5258,7 @@ private:
                 else collector.consider_extra_only(*candidate);
             }
         }
-        result.candidates = collector.take(cap);
+        collector.take_sharded(cap, result.candidates, result.keys, result.shard_offsets);
         result.extra_candidates = collector.take_extras(pareto_extra_cap());
         return result;
     }
@@ -4509,7 +5357,8 @@ private:
 
         for (unsigned round = 0; round < cfg_.deep_rounds; ++round) {
             const auto round_start = std::chrono::steady_clock::now();
-            std::map<unsigned, CandidateCollector> collectors;
+            CostArchives collectors(cfg_.max_cost, cfg_.target, state_value_bits(cfg_), deep_cap,
+                                    cfg_.pareto_slots, pareto_extra_cap(), kDefaultNearFraction);
 
             for (std::size_t op_index = 0; op_index < unary_ops_.size(); ++op_index) {
                 const UnarySpec& op = unary_ops_[op_index];
@@ -4522,10 +5371,6 @@ private:
                     }
                     const auto& ids = *ids_ptr;
                     if (ids.empty()) continue;
-                    auto [collector_it, _] = collectors.try_emplace(
-                        total_cost, cfg_.target, state_value_bits(cfg_), deep_cap, false, 0,
-                        cfg_.pareto_slots, pareto_extra_cap());
-                    CandidateCollector& collector = collector_it->second;
                     const std::size_t chunks = std::min<std::size_t>(
                         ids.size(), std::max<std::size_t>(1, std::min<std::size_t>(
                             cfg_.task_chunks, static_cast<std::size_t>(cfg_.threads) * 2)));
@@ -4549,42 +5394,17 @@ private:
                             if (!has_seen_state(key)) local.consider_with_key(*candidate, key);
                             else local.consider_extra_only(*candidate);
                         }
-                        result.candidates = local.take(deep_cap);
+                        local.take_sharded(deep_cap, result.candidates, result.keys,
+                                           result.shard_offsets);
                         result.extra_candidates = local.take_extras(pareto_extra_cap());
                     });
-                    CostStats& cs = stats_.by_cost[total_cost];
-                    for (const TaskResult& result : results) {
-                        cs.attempted = saturating_add(cs.attempted, result.attempted);
-                        cs.valid = saturating_add(cs.valid, result.valid);
-                        cs.task_candidates += result.candidates.size();
-                        stats_.attempted = saturating_add(stats_.attempted, result.attempted);
-                        stats_.valid = saturating_add(stats_.valid, result.valid);
-                        for (const Candidate& candidate : result.candidates) collector.consider(candidate);
-                        for (const Candidate& candidate : result.extra_candidates) {
-                            collector.consider_extra_only(candidate);
-                        }
-                    }
+                    merge_deep_results(collectors, total_cost, results);
                 }
             }
 
             const auto merge_binary_results = [&](unsigned total_cost,
                                                   std::vector<TaskResult>& results) {
-                auto [collector_it, _] = collectors.try_emplace(
-                            total_cost, cfg_.target, state_value_bits(cfg_), deep_cap, false, 0,
-                    cfg_.pareto_slots, pareto_extra_cap());
-                CandidateCollector& collector = collector_it->second;
-                CostStats& cs = stats_.by_cost[total_cost];
-                for (const TaskResult& result : results) {
-                    cs.attempted = saturating_add(cs.attempted, result.attempted);
-                    cs.valid = saturating_add(cs.valid, result.valid);
-                    cs.task_candidates += result.candidates.size();
-                    stats_.attempted = saturating_add(stats_.attempted, result.attempted);
-                    stats_.valid = saturating_add(stats_.valid, result.valid);
-                    for (const Candidate& candidate : result.candidates) collector.consider(candidate);
-                    for (const Candidate& candidate : result.extra_candidates) {
-                        collector.consider_extra_only(candidate);
-                    }
-                }
+                merge_deep_results(collectors, total_cost, results);
             };
 
             for (const BinarySpec& op : binary_ops_) {
@@ -4624,7 +5444,10 @@ private:
             std::vector<std::vector<ExprId>> next_frontier(layers_.size());
             std::size_t appended = 0;
             std::vector<Candidate> live_candidates;
-            for (auto& [cost, collector] : collectors) {
+            for (unsigned cost = 1; cost <= cfg_.max_cost; ++cost) {
+                if (!collectors.has(cost)) continue;
+                ShardedArchive& collector = collectors.at(cost);
+                collector.prepare(executor_);
                 auto candidates = collector.take(deep_cap);
                 auto extras = collector.take_extras(pareto_extra_cap());
                 candidates.insert(candidates.end(), extras.begin(), extras.end());
@@ -4672,6 +5495,19 @@ private:
             }
             frontier = std::move(next_frontier);
         }
+    }
+
+    void merge_deep_results(CostArchives& collectors, unsigned total_cost,
+                            const std::vector<TaskResult>& results) {
+        CostStats& cs = stats_.by_cost[total_cost];
+        for (const TaskResult& result : results) {
+            cs.attempted = saturating_add(cs.attempted, result.attempted);
+            cs.valid = saturating_add(cs.valid, result.valid);
+            cs.task_candidates += result.candidates.size();
+            stats_.attempted = saturating_add(stats_.attempted, result.attempted);
+            stats_.valid = saturating_add(stats_.valid, result.valid);
+        }
+        collectors.at(total_cost).absorb(results, executor_);
     }
 
     std::vector<ExprId> select_pslq_basis() const {
@@ -6200,6 +7036,7 @@ private:
                 if (arena_[a].value != arena_[b].value) return arena_[a].value < arena_[b].value;
                 return arena_[a].hash < arena_[b].hash;
             });
+            refresh_layer_values(cost);
             stats_.by_cost[cost].kept = layer.size();
         }
     }
@@ -6324,8 +7161,11 @@ private:
         const std::uint64_t maximum_table_size = saturating_add(saturating_mul(soft_cap, 2), 1);
         const std::size_t reserve_hint = static_cast<std::size_t>(
             std::max<std::uint64_t>(1, std::min(candidate_upper_bound, maximum_table_size)));
-        CandidateCollector collector(cfg_.target, state_value_bits(cfg_), soft_cap, cfg_.equations, reserve_hint,
-                                     cfg_.pareto_slots, pareto_extra_cap());
+        CandidateCollector collector(cfg_.target, state_value_bits(cfg_), soft_cap, cfg_.equations,
+                                     reserve_hint, cfg_.pareto_slots, pareto_extra_cap(), false,
+                                     task.total_cost <= generation_cost_limit()
+                                         ? cfg_.side_near_fraction
+                                         : kDefaultNearFraction);
         TaskResult result;
 
         if (task.type == GenTask::Type::Unary) {
@@ -6345,7 +7185,8 @@ private:
                     }
                 }
             }
-            result.candidates = collector.take(std::max<std::size_t>(cfg_.beam, 256));
+            collector.take_sharded(std::max<std::size_t>(cfg_.beam, 256), result.candidates,
+                                   result.keys, result.shard_offsets);
             result.extra_candidates = collector.take_extras(pareto_extra_cap());
             return result;
         }
@@ -6377,10 +7218,18 @@ private:
 
         const auto& outer_ids = task.reverse ? right_ids : left_ids;
         const auto& inner_ids = task.reverse ? left_ids : right_ids;
+        const std::vector<double>& outer_values =
+            layer_values_[task.reverse ? task.right_cost : task.left_cost];
+        const std::vector<double>& inner_values =
+            layer_values_[task.reverse ? task.left_cost : task.right_cost];
+        const double* const inner_data = inner_values.data();
+        const std::size_t inner_size = inner_values.size();
         std::vector<std::size_t> js;
         const std::size_t nearby_capacity =
             (!task.reverse && op.kind == BinaryKind::Pow) ? 5U + 8U * 5U : 5U;
         js.reserve(task.samples_per_outer + nearby_capacity + cfg_.explore_pairs);
+        std::size_t desired_hint = 0;
+        std::size_t equation_hint = 0;
 
         // These exponent neighborhoods depend only on the value-sorted inner
         // layer, yet this loop used to binary-search and rebuild them for every
@@ -6392,9 +7241,10 @@ private:
                 -3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 2.0, 3.0
             };
             useful_exponent_indices.reserve(8U * cfg_.inverse_neighbors);
+            std::size_t exponent_hint = 0;
             for (const double exponent : useful_exponents) {
-                add_window_indices(useful_exponent_indices, inner_ids, arena_, exponent, 0,
-                                   cfg_.inverse_neighbors);
+                add_window_indices(useful_exponent_indices, inner_data, inner_size, exponent, 0,
+                                   cfg_.inverse_neighbors, exponent_hint);
             }
             std::sort(useful_exponent_indices.begin(), useful_exponent_indices.end());
             useful_exponent_indices.erase(
@@ -6406,7 +7256,7 @@ private:
                                       useful_exponent_indices.empty();
         for (std::size_t i = task.begin; i < task.end; ++i) {
             const std::size_t lower = !task.reverse && task.equal_commutative ? i : 0;
-            if (lower >= inner_ids.size()) continue;
+            if (lower >= inner_size) continue;
             if (task.full || equation_exhaustive) {
                 for (std::size_t j = lower; j < inner_ids.size(); ++j) {
                     evaluate_pair(outer_ids[i], inner_ids[j]);
@@ -6414,33 +7264,43 @@ private:
                 continue;
             }
 
-            js.clear();
-            const double outer_value = arena_[outer_ids[i]].value;
+            const double outer_value = outer_values[i];
             const auto desired = task.reverse ? desired_left(op.kind, outer_value, cfg_.target)
                                               : desired_right(op.kind, outer_value, cfg_.target);
+            if (near_window_only) {
+                // A single contiguous target window needs no index list: walk
+                // the range directly and skip millions of tiny vector churns.
+                if (!desired) continue;
+                const ValueWindow window = value_window(inner_data, inner_size, *desired, lower,
+                                                        cfg_.inverse_neighbors, desired_hint);
+                if (task.reverse) {
+                    for (std::size_t j = window.begin; j < window.end; ++j) {
+                        evaluate_pair(inner_ids[j], outer_ids[i]);
+                    }
+                } else {
+                    for (std::size_t j = window.begin; j < window.end; ++j) {
+                        evaluate_pair(outer_ids[i], inner_ids[j]);
+                    }
+                }
+                continue;
+            }
+
+            js.clear();
             if (cfg_.equations) {
                 // For an equality the useful partner is normally near the
                 // outer expression's value, not near TARGET.  Keep the old
                 // target-directed window too: it remains useful for equations
                 // such as x^2 = 2 where one side is the requested expansion
                 // point and the other side is a constant.
-                add_window_indices(js, inner_ids, arena_, outer_value, lower,
-                                   cfg_.equation_neighbors);
+                add_window_indices(js, inner_data, inner_size, outer_value, lower,
+                                   cfg_.equation_neighbors, equation_hint);
             }
             if (desired) {
-                add_window_indices(js, inner_ids, arena_, *desired, lower, cfg_.inverse_neighbors);
+                add_window_indices(js, inner_data, inner_size, *desired, lower,
+                                   cfg_.inverse_neighbors, desired_hint);
             }
             if (!useful_exponent_indices.empty()) {
                 js.insert(js.end(), useful_exponent_indices.begin(), useful_exponent_indices.end());
-            }
-            if (near_window_only) {
-                // A single contiguous target window is already sorted and
-                // unique; avoid millions of tiny sort/unique calls.
-                for (const std::size_t j : js) {
-                    if (task.reverse) evaluate_pair(inner_ids[j], outer_ids[i]);
-                    else evaluate_pair(outer_ids[i], inner_ids[j]);
-                }
-                continue;
             }
 
             const std::size_t range = inner_ids.size() - lower;
@@ -6478,7 +7338,8 @@ private:
             }
         }
 
-        result.candidates = collector.take(std::max<std::size_t>(cfg_.beam, 256));
+        collector.take_sharded(std::max<std::size_t>(cfg_.beam, 256), result.candidates,
+                               result.keys, result.shard_offsets);
         result.extra_candidates = collector.take_extras(pareto_extra_cap());
         return result;
     }
@@ -6490,6 +7351,9 @@ private:
     std::vector<BinarySpec> binary_ops_;
     std::vector<Node> arena_;
     std::vector<std::vector<ExprId>> layers_;
+    // Values of `layers_`, in the same order.  Kept in step with every layer
+    // sort so the pair loops can binary-search contiguous doubles.
+    std::vector<std::vector<double>> layer_values_;
     std::vector<std::vector<ExprId>> extra_layers_;
     std::vector<std::uint64_t> seen_filter_;
     std::size_t seen_filter_mask_{};
@@ -7059,6 +7923,66 @@ static std::optional<double> evaluate_equation_residual(const Config& cfg,
     return valid_numeric(residual, cfg) ? std::optional<double>{residual} : std::nullopt;
 }
 
+// Number of ulps of the operand magnitude below which a residual carries no
+// information: at that separation the two sides round to the same double, so
+// `L - R` says nothing about whether L and R are mathematically equal.
+inline constexpr double kResidualNoiseUlps = 128.0;
+
+struct EquationSample {
+    double residual{};
+    double noise_floor{};
+};
+
+static std::optional<EquationSample> sample_equation(const Config& cfg,
+                                                     const std::vector<Node>& arena,
+                                                     ExprId left,
+                                                     ExprId right,
+                                                     double variable) {
+    const auto left_value = evaluate_equation_node(cfg, arena, left, variable);
+    const auto right_value = evaluate_equation_node(cfg, arena, right, variable);
+    if (!left_value || !right_value) return std::nullopt;
+    const double residual = *left_value - *right_value;
+    if (!valid_numeric(residual, cfg)) return std::nullopt;
+    const double scale = std::max({1.0, std::abs(*left_value), std::abs(*right_value)});
+    return EquationSample{residual,
+                          kResidualNoiseUlps * std::numeric_limits<double>::epsilon() * scale};
+}
+
+// A root has to be an isolated zero of the residual, not a stretch where the
+// two sides happen to round to the same double.
+//
+// `L - R` loses every bit of information once the difference falls under the
+// precision of L and R: `exp(sqrt(x)) - inv(x)` is bit-identical to
+// `exp(sqrt(x))` for any large x, so the residual is flatly zero over a whole
+// interval and "solving" the equation is vacuous.  Require instead that the
+// residual vanishes at the root and becomes resolvable again on both sides of
+// it.  A sign change is deliberately not required: x = x^x has a genuine
+// tangential root at one, where the residual is -(x-1)^2.
+static bool equation_root_is_isolated(const Config& cfg,
+                                      const std::vector<Node>& arena,
+                                      ExprId left,
+                                      ExprId right,
+                                      double root) {
+    if (cfg.equation_quality == EquationQualityMode::Off) return true;
+    if (!std::isfinite(root)) return false;
+
+    const auto at_root = sample_equation(cfg, arena, left, right, root);
+    if (!at_root || std::abs(at_root->residual) > at_root->noise_floor) return false;
+
+    const double magnitude = std::max(1.0, std::abs(root));
+    const double limit = 1.0e-2 * magnitude;
+    for (double step = 1.0e-9 * magnitude; step <= limit; step *= 4.0) {
+        const auto below = sample_equation(cfg, arena, left, right, root - step);
+        const auto above = sample_equation(cfg, arena, left, right, root + step);
+        if (!below || !above) continue;
+        if (std::abs(below->residual) > below->noise_floor &&
+            std::abs(above->residual) > above->noise_floor) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool equation_is_stable(const Config& cfg,
                                const std::vector<Node>& arena,
                                ExprId left,
@@ -7141,11 +8065,13 @@ static std::optional<double> refine_equation_root(const Config& cfg,
 
     auto at_target = evaluate(cfg.target);
     if (!at_target) return std::nullopt;
+    // Convergence has to mean "the sides are the same double", not "the residual
+    // is small relative to them".  The old 1e-12 relative term accepted a
+    // residual a million times larger than the operands could resolve, which is
+    // what let a nonzero difference be reported as a root at the target.
     const auto converged = [](double residual, double scale) {
-        const double tolerance = std::max(
-            128.0 * std::numeric_limits<double>::epsilon() * scale,
-            1.0e-12 * scale);
-        return std::abs(residual) <= tolerance;
+        return std::abs(residual) <=
+               kResidualNoiseUlps * std::numeric_limits<double>::epsilon() * scale;
     };
     if (converged(at_target->first, at_target->second)) return cfg.target;
 
@@ -7167,7 +8093,9 @@ static std::optional<double> refine_equation_root(const Config& cfg,
 
     const double travel_limit = std::max(
         2.0, 8.0 * std::abs(initial_root - cfg.target) + 0.1 * std::max(1.0, std::abs(cfg.target)));
-    for (unsigned iteration = 0; iteration < 20; ++iteration) {
+    // Newton converges linearly at a double root, so the iteration budget has to
+    // cover the extra steps that the tightened tolerance now asks for.
+    for (unsigned iteration = 0; iteration < 64; ++iteration) {
         if (converged(current->first, current->second)) return current_x;
 
         const double h = std::clamp(
@@ -7214,6 +8142,13 @@ static std::optional<double> refine_equation_root(const Config& cfg,
         previous_residual = current->first;
         current_x = next_x;
         current = std::move(next);
+
+        // Newton keeps "improving" forever on a residual that shrinks without
+        // ever reaching zero -- x = x + 1/(8x) doubles x on every step, and its
+        // residual falls the whole way.  The initial estimate already bounds how
+        // far a real root can be, so stop wandering instead of spending the
+        // whole iteration budget on an equation that has no root.
+        if (std::abs(current_x - cfg.target) > travel_limit) return std::nullopt;
     }
 
     return current && converged(current->first, current->second)
@@ -7266,6 +8201,7 @@ static std::vector<EquationMatch> collect_equation_matches(const Config& cfg,
             const auto refined_root = refine_equation_root(cfg, arena, left, right, initial_root);
             if (!refined_root) continue;
             const double root = *refined_root;
+            if (!equation_root_is_isolated(cfg, arena, left, right, root)) continue;
             const double correction = root - cfg.target;
             const double error = std::abs(correction);
             if (!cfg.error_range.contains(correction)) continue;
@@ -7458,6 +8394,8 @@ static std::string json_escape(std::string_view text) {
 static std::string search_strategy_name(const SearchStats& stats) {
     std::string name = stats.used_mitm ? "mitm" : "layered";
     if (stats.used_portfolio) name += "+portfolio";
+    if (stats.used_anchor_extension) name += "+anchor";
+    if (stats.used_unary_closure) name += "+unary";
     if (stats.used_inverse_templates) name += "+inverse";
     if (stats.used_deep_compositions) name += "+deep";
     if (stats.used_exploration) name += "+explore";
@@ -7491,6 +8429,12 @@ static void print_stats(const SearchRun& run) {
               << " threads=" << run.cfg.threads << " attempted=" << run.stats.attempted
               << " valid=" << run.stats.valid << " kept=" << run.stats.kept;
     if (run.stats.pareto_extras > 0) std::cerr << " pareto_extras=" << run.stats.pareto_extras;
+    if (run.stats.used_anchor_extension) {
+        std::cerr << " anchor_candidates=" << run.stats.anchor_extension_candidates;
+    }
+    if (run.stats.used_unary_closure) {
+        std::cerr << " unary_candidates=" << run.stats.unary_closure_candidates;
+    }
     if (run.stats.used_inverse_templates) {
         std::cerr << " inverse_candidates=" << run.stats.inverse_candidates;
     }
@@ -7554,7 +8498,11 @@ static void print_equation_results(const SearchRun& run) {
         }
         std::cout << "  ],\n  \"stats\": {\"threads\": " << run.cfg.threads
                   << ", \"attempted\": " << run.stats.attempted << ", \"valid\": " << run.stats.valid
-                  << ", \"kept\": " << run.stats.kept << ", \"genetic_generations\": "
+                  << ", \"kept\": " << run.stats.kept
+                  << ", \"anchor_candidates\": " << run.stats.anchor_extension_candidates
+                  << ", \"unary_candidates\": " << run.stats.unary_closure_candidates
+                  << ", \"inverse_candidates\": " << run.stats.inverse_candidates
+                  << ", \"genetic_generations\": "
                   << run.stats.genetic_generations << ", \"genetic_repairs\": "
                   << run.stats.genetic_repairs << ", \"genetic_repairs_kept\": "
                   << run.stats.genetic_repairs_kept << ", \"genetic_crossovers\": "
@@ -7638,7 +8586,11 @@ static void print_results(const SearchRun& run) {
         }
         std::cout << "  ],\n  \"stats\": {\"threads\": " << run.cfg.threads
                   << ", \"attempted\": " << run.stats.attempted << ", \"valid\": " << run.stats.valid
-                  << ", \"kept\": " << run.stats.kept << ", \"genetic_generations\": "
+                  << ", \"kept\": " << run.stats.kept
+                  << ", \"anchor_candidates\": " << run.stats.anchor_extension_candidates
+                  << ", \"unary_candidates\": " << run.stats.unary_closure_candidates
+                  << ", \"inverse_candidates\": " << run.stats.inverse_candidates
+                  << ", \"genetic_generations\": "
                   << run.stats.genetic_generations << ", \"genetic_repairs\": "
                   << run.stats.genetic_repairs << ", \"genetic_repairs_kept\": "
                   << run.stats.genetic_repairs_kept << ", \"genetic_crossovers\": "
@@ -7831,6 +8783,8 @@ static void print_help(const char* program) {
         << "  --threads N               工作线程数，默认硬件并发数\n"
         << "  --task-chunks N           每个组合分区的固定任务块数，默认 64\n"
         << "  --value-bits N            数值分桶保留的尾数位，0..52，默认 42\n"
+        << "  --near-fraction X         生成层中靠近目标的候选占比，0.02..1，默认 0.6；"
+           "更小的值把预算移向数值轴覆盖\n"
         << "  --value-prune MODE         数值去重：bucket（按 value-bits）或 exact（严格 double 值），默认 bucket\n"
         << "  --explore-pairs N          每个非完整外层额外确定性采样的二元组合数，0=关闭，默认 0（最大 1000000）\n"
         << "  --pareto-slots N          每个数值桶结构槽数，1..4，默认 1（侧车不挤占 beam）\n"
@@ -8304,6 +9258,9 @@ static Config parse_cli(int argc, char** argv) {
             cfg.task_chunks = static_cast<std::size_t>(parse_u64(option_value(i, argc, argv, arg, "--task-chunks"), "--task-chunks"));
         } else if (option_matches(arg, "--value-bits")) {
             cfg.value_bits = parse_unsigned(option_value(i, argc, argv, arg, "--value-bits"), "--value-bits");
+        } else if (option_matches(arg, "--near-fraction")) {
+            cfg.side_near_fraction = parse_double(
+                option_value(i, argc, argv, arg, "--near-fraction"), "--near-fraction");
         } else if (option_matches(arg, "--result-value-bits")) {
             cfg.result_value_bits = parse_unsigned(
                 option_value(i, argc, argv, arg, "--result-value-bits"), "--result-value-bits");
@@ -8551,6 +9508,9 @@ static Config parse_cli(int argc, char** argv) {
     if (cfg.threads == 0) cfg.threads = std::max(1U, std::thread::hardware_concurrency());
     if (cfg.task_chunks == 0) throw std::runtime_error("--task-chunks 必须大于 0");
     if (cfg.value_bits > 52) throw std::runtime_error("--value-bits 必须在 0..52 之间");
+    if (!(cfg.side_near_fraction >= 0.02) || !(cfg.side_near_fraction <= 1.0)) {
+        throw std::runtime_error("--near-fraction 必须在 0.02..1 之间");
+    }
     if (cfg.result_value_bits > 52) {
         throw std::runtime_error("--result-value-bits 必须在 0..52 之间");
     }
@@ -9250,6 +10210,89 @@ static int run_self_test() {
               "严格方程质量过滤单位周期伪根且保留兼容开关");
     }
     {
+        // sin(pi) evaluates to 1.22e-16 where the true value is zero, so it has no
+        // significant digits and must not become a building block: everything
+        // derived from it is noise, which is how sqrt(sin(pi)) used to decorate
+        // the Dottie number and pi^inv(tan(x/e)) = sin(pi) used to be "solved".
+        Config cfg;
+        cfg.target = std::sin(std::numbers::pi_v<double>);
+        cfg.digits = "";
+        cfg.constants = "pi";
+        cfg.ops = "sin,cos,neg";
+        cfg.max_cost = 4;
+        cfg.show_stats = false;
+        cfg.stop_on_epsilon = false;
+        const SearchRun run = SearchEngine(cfg).run();
+        const bool noise_rejected = std::none_of(
+            run.arena.begin(), run.arena.end(), [](const Node& node) {
+                return node.value != 0.0 && std::abs(node.value) < 1.0e-10;
+            });
+        check(noise_rejected && !run.arena.empty(),
+              "无有效位的取消噪声不进入搜索空间");
+    }
+    {
+        // The same filter must keep a well conditioned small difference: pi-22/7
+        // is tiny but every digit of it is real.
+        check(value_is_significant(std::numbers::pi_v<double> - 22.0 / 7.0, 1.0e-15) &&
+                  !value_is_significant(std::sin(std::numbers::pi_v<double>),
+                                        rounding_error(std::numbers::pi_v<double>)) &&
+                  value_is_significant(0.0, 1.0e-3),
+              "有效位判据区分真实小量与噪声");
+    }
+    {
+        // exp(sqrt(x)) - inv(x) is bit-identical to exp(sqrt(x)) for a large x, so
+        // the residual is flatly zero over an interval and the equality carries no
+        // information.  The same absorption at a coarser scale used to report
+        // x = x + inv(x) as an exact solution.
+        Config cfg;
+        cfg.target = 1.0e9;
+        cfg.equations = true;
+        std::vector<Node> arena(3);
+        arena[0].value = cfg.target;
+        arena[0].derivative = 1.0;
+        arena[0].tag = NodeTag::Atom;
+        arena[0].depends_on_x = true;
+        arena[1].value = 1.0 / cfg.target;
+        arena[1].derivative = -1.0 / (cfg.target * cfg.target);
+        arena[1].tag = NodeTag::Unary;
+        arena[1].op = static_cast<std::uint8_t>(UnaryKind::Inv);
+        arena[1].left = 0;
+        arena[1].depends_on_x = true;
+        arena[2].value = arena[0].value + arena[1].value;
+        arena[2].derivative = arena[0].derivative + arena[1].derivative;
+        arena[2].tag = NodeTag::Binary;
+        arena[2].op = static_cast<std::uint8_t>(BinaryKind::Add);
+        arena[2].left = 0;
+        arena[2].right = 1;
+        arena[2].depends_on_x = true;
+        const bool absorbed_rejected =
+            !equation_root_is_isolated(cfg, arena, 0, 2, cfg.target);
+        cfg.equation_quality = EquationQualityMode::Off;
+        const bool legacy_accepts = equation_root_is_isolated(cfg, arena, 0, 2, cfg.target);
+        check(absorbed_rejected && legacy_accepts,
+              "数值吸收造成的伪根被拒绝且保留兼容开关");
+    }
+    {
+        // A tangential root is still a root: x = x*x has one at one, where the
+        // residual is x - x*x and never changes sign on the way in.
+        Config cfg;
+        cfg.target = 1.0;
+        cfg.equations = true;
+        std::vector<Node> arena(2);
+        arena[0].value = cfg.target;
+        arena[0].derivative = 1.0;
+        arena[0].tag = NodeTag::Atom;
+        arena[0].depends_on_x = true;
+        arena[1].value = cfg.target * cfg.target;
+        arena[1].derivative = 2.0 * cfg.target;
+        arena[1].tag = NodeTag::Unary;
+        arena[1].op = static_cast<std::uint8_t>(UnaryKind::Sqr);
+        arena[1].left = 0;
+        arena[1].depends_on_x = true;
+        check(equation_root_is_isolated(cfg, arena, 0, 1, cfg.target),
+              "孤立零点即使不变号也判为方程根");
+    }
+    {
         Config cfg;
         cfg.target = std::sqrt(2.0);
         cfg.equations = true;
@@ -9312,27 +10355,52 @@ static int run_self_test() {
               "通用深层拼接构造 (sqrt(2)+sqrt(3))^2");
     }
     {
+        // A unary chain above the side cost is now closed by the terminal unary
+        // stage, so the recursive inverse templates are probed with a shape they
+        // still own: a left-leaning sum whose cheaper side is itself too
+        // expensive to be a meet-in-the-middle side.
         Config cfg;
-        cfg.target = 2.0;
-        for (unsigned i = 0; i < 5; ++i) cfg.target = std::sqrt(cfg.target);
+        cfg.target = 3.0 * std::sqrt(2.0);
         cfg.digits = "2";
+        cfg.max_literal_len = 1;
         cfg.constants = "none";
-        cfg.ops = "+:5,sqrt";
-        cfg.max_cost = 6;
-        cfg.side_cost = 4;
-        cfg.beam = 50;
-        cfg.pair_budget = 1'000;
+        cfg.ops = "+,sqrt";
+        cfg.max_cost = 8;
+        cfg.side_cost = 3;
+        cfg.beam = 200;
+        cfg.pair_budget = 100'000;
         cfg.inverse_depth = 2;
-        cfg.inverse_beam = 32;
-        cfg.inverse_budget = 10'000;
+        cfg.inverse_beam = 64;
+        cfg.inverse_budget = 200'000;
         cfg.show_stats = false;
         const SearchRun run = SearchEngine(cfg).run();
         const auto matches = collect_matches(run);
         const bool found = std::any_of(matches.begin(), matches.end(), [&](const Match& match) {
-            return match.cost == 6 && std::abs(match.value - cfg.target) <= 1.0e-15;
+            return match.cost == 8 && std::abs(match.value - cfg.target) <= 1.0e-14;
         });
         check(found && run.stats.used_inverse_templates && run.stats.inverse_candidates > 0,
               "Pareto 输出递归 inverse 独占成本层");
+    }
+    {
+        // Above the side cost the partition sweep only produces binary roots.
+        // sqrt(5+5+4) costs six with a side cost of five, so it is reachable
+        // only when the finished layers are closed under the unary operators.
+        Config cfg;
+        cfg.target = std::sqrt(14.0);
+        cfg.digits = "2345";
+        cfg.max_literal_len = 1;
+        cfg.constants = "none";
+        cfg.ops = "+,sqrt";
+        cfg.max_cost = 10;
+        cfg.show_stats = false;
+        cfg.stop_on_epsilon = false;
+        const SearchRun run = SearchEngine(cfg).run();
+        const auto matches = collect_matches(run);
+        const bool found = std::any_of(matches.begin(), matches.end(), [&](const Match& match) {
+            return match.cost == 6 && std::abs(match.value - cfg.target) <= 4.0e-15;
+        });
+        check(found && run.stats.used_mitm && run.stats.used_unary_closure,
+              "终局阶段闭合一元算子还原 sqrt(5+5+4)");
     }
     {
         Config cfg;

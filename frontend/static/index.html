@@ -225,6 +225,11 @@
                 <input id="valueBits" type="number" min="0" max="52" value="42" data-option="--value-bits" data-default="42">
               </label>
               <label class="field">
+                <span>近目标占比 <code>--near-fraction</code></span>
+                <input id="nearFraction" type="number" min="0.02" max="1" step="0.01" value="0.6" data-option="--near-fraction" data-default="0.6">
+                <small>生成层里靠近目标的候选占比，其余预算用于覆盖数值轴；调小对两侧都远离目标的等式更有利。</small>
+              </label>
+              <label class="field">
                 <span>数值剪枝 <code>--value-prune</code></span>
                 <select id="valuePrune" data-option="--value-prune" data-default="bucket">
                   <option value="bucket">bucket · 快速近似分桶</option>
