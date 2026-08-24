@@ -1,4 +1,4 @@
-# Fates：Finding Algebraic Targets via Expression Search
+# Fates：Finding Algebraic Targets via Expression Search 666
 
 Fates 根据给定的目标值，搜索由数字、常数和运算符组成的表达式，并按复杂度和误差输出结果。程序也支持含变量 `x` 的方程搜索。
 
