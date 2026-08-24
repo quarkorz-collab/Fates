@@ -9,6 +9,7 @@ Fates 根据给定的目标值，搜索由数字、常数和运算符组成的�
 - `fates` / `fates.exe`：命令行程序；
 - `fates-web.exe`：本地网页界面，调用同目录下的 `fates.exe`。
 
+
 `pries` / `pries.exe` 是为旧脚本保留的兼容名称，与 `fates` 使用同一份程序代码。
 
 ## 功能
