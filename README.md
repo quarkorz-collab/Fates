@@ -197,7 +197,13 @@ PowerShell 中建议给区间加引号，以保留括号的开闭含义。
 
 `--equation-quality` 可选 `strict`、`local` 或 `off`。默认模式会对候选根重新求值，并检查邻域定义域和导数。方程模式不支持遗传、PSLQ、e-graph、MCTS、递归逆模板和深层组合。
 
-`strict` 和 `local` 都要求候选根是残差的**孤立零点**：残差在根处落到两侧操作数的可分辨精度以内，并且在根两侧重新变得可分辨。这条规则排除掉数值吸收造成的伪解——`exp(sqrt(x))-inv(x)` 在 x 较大时与 `exp(sqrt(x))` 是同一个 double，残差在整段区间上恒为零，`x = x+inv(8)/x` 同理无解。不要求变号，因此 `x = x^x` 在 1 处的切触根仍会被保留。`off` 不做这项检查。
+`strict` 和 `local` 都要求候选根可被可靠定位，并且是残差的**孤立零点**。收敛检查使用残差除以解析导数得到的根修正量，同时把累计舍入误差折算成根位置的不确定度，不能仅凭两侧数值很接近就返回目标值。根两侧的残差还必须重新变得可分辨。这些检查排除数值吸收造成的伪解——`exp(sqrt(x))-inv(x)` 在 x 较大时与 `exp(sqrt(x))` 是同一个 double，残差在整段区间上恒为零，`x = x+inv(8)/x` 同理无解。不要求变号；可精确复核的切触根（如 `x = x^x` 在 1 处）仍会被保留。`off` 不做这些检查。
+
+邻域复核还会传播整棵表达式的舍入误差，不能把中间抵消造成的数值波动当作根附近的有效信号。例如 `x+gamma/x^phi = inv(gamma+inv(x)-gamma)` 在实数定义域内无解，但右侧的抵消误差经倒数放大后，曾让它在目标 `77777` 附近被误报为精确解。`strict` 和 `local` 现在拒绝这类数值不可靠的结果；`off` 保留旧的无质量检查行为。此复核是保守的数值筛选，不是符号求解或存在性证明。
+
+另一个例子是 `inv(pi*x)-x = sin(x)/x-x`：它有实根，但目标 `777777` 不是根，最近的根约为 `777776.9835659464`，偏移约 `-0.0164340536`。共同的大项 `-x` 曾让旧的残差阈值直接接受目标值。这类无法用 double 可靠定位的表示现在会被拒绝，而不是报成零误差；消去共同项后的条件良好等价式仍能正常求根。筛选不进行字符串黑名单匹配，也不改变表达式生成空间。
+
+方程匹配使用与生成阶段相同的线程池；固定邻域探针按表达式缓存，独立配对按固定分块并行求根，各分块只保留所需排名候选。求根复用目标点已有的数值、解析导数和误差，并在迭代中使用解析导数，避免对相消后的残差再做数值微分。实时输出最后一层后，最终输出复用该排名，不重复进行全量匹配。线程数和实时榜单大小不会改变最终结果。
 
 方程搜索的两侧都直接取自生成层，没有 meet-in-the-middle 阶段，因此单侧成本上限约为 `--max-cost` 的一半，且配对只在按数值排序后的 `--equation-neighbors` 邻域内进行。想放宽可以调 `--side-cost` 和 `--equation-neighbors`，但代价陡峭且收益少见：在实测的五个目标里，同时放宽两者要花 4–15 倍时间，只有一个目标的误差从 2.40e-7 改善到 1.01e-7，其余完全不变。
 
@@ -242,6 +248,8 @@ MCTS 使用渐进拓宽和 UCT，在目标反推近邻中扩展表达式。奖�
 ```
 
 JSON 结果同时包含纯文本表达式和 LaTeX 表示。实时 JSON 事件写入标准错误，最终 JSON 写入标准输出，两个通道可以分别重定向。
+
+方程模式的 `stats.seconds` 包含表达式生成和最终方程匹配，`stats.stage_seconds.equations` 单列所有匹配轮次的时间，`deterministic` 不再重复计算这部分。实时事件的 `elapsed` 在该轮匹配结束后记录。网页仍显示整个子进程的运行时间，因此还包含启动和输出等少量开销。
 
 ## 本地网页界面
 
@@ -369,11 +377,23 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 
 CMake 构建使用 CTest 注册同一项自测。完整命令行回归位于 `tests/smoke.sh`；容器后端比较位于 `tests/benchmark_containers.ps1`。
 
-搜索性能和漏解情况有两个专用脚本，都只依赖标准库：
+完整 `77777`、`777777` 方程样例共 22 组回归，覆盖假根过滤、1/4/16 线程，以及关闭实时输出、实时榜单小于/大于最终榜单的情况。测试还使用 Python 标准库的 80 位 Decimal 独立解析并检查每条实时和最终结果，核对真实根的位置，而不只检查残差或屏蔽几个已知方程：
+
+```bash
+python tests/check_equation_regressions.py --bin build/fates
+```
+
+搜索性能和漏解情况可用以下脚本检查，都只依赖标准库：
 
 ```bash
 # 交替计时两个二进制并取各自最快一次，抵消后台负载
 python tests/bench_search.py --bin build/fates --compare build-old/fates
+
+# 深搜逐阶段计时，同时严格核对最终结果列表和所有非计时统计
+# 此负载保留 --live --json --live-json，包含实时输出的开销
+python tests/bench_search_stages.py --bin build/fates --compare build-old/fates \
+  --workload constants-deep-live --threads 16 --repeats 3 \
+  --json-out artifacts/deep-comparison.json
 
 # 用同一二进制的完整逐层搜索（--no-bidirectional，大 beam）作参考，
 # 统计默认有界搜索还差多少
@@ -387,6 +407,14 @@ python tests/sweep_search.py --bin build/fates \
 ```
 
 `recall` 的参考值会缓存到 `--reference-cache`，重复运行时不再重算。基准结果会受到处理器、编译器、线程数和系统负载影响，不应直接作为跨机器性能结论。
+
+`bench_search_stages.py` 保存每次运行的完整 JSON、分阶段耗时、中位数和最快值；结果或搜索计数发生变化时会以非零状态退出。启用实时 JSON 的样例还会校验每个事件的格式和时间顺序，以及最终实时榜单的一致性（不比较事件数量和时间戳）。`--variant 名称=路径` 可加入更多版本，按轮次交错执行。
+
+`--workload` 可重复指定：`web-deep` 对应网页深搜预设；`constants-deep-live` 是目标 `777777`、仅使用 `pi,e,phi,gamma`、成本上限 16、beam 20000、逆模板和深搜均开启的实时输出样例；`deep-multiround`、`deep-constraints`、`deep-low-chunks`、`deep-sparse`、`equation-pareto` 和 `full-pareto` 用于小规模差分回归。
+
+结构候选与主候选均按状态键分片合并，同一分片仍保持原有的任务顺序和“先主候选、后结构候选”的顺序。裁剪临时缓冲区按工作线程复用，结构候选排序采用紧凑记录；这些优化不改变候选预算、排序规则或数值覆盖策略。线程池在调用线程领完任务后关闭本轮入口，等待已参与的工作线程结束，尚未参与的迟到线程无需再确认空任务。
+
+实时榜单没有接收到合格候选，或榜单已满且前列候选的全部字段都未变化时，会跳过重复公式渲染；真正的改善仍按原有规则更新和输出。
 
 Windows 上没有 Developer Prompt 时，可用 `scripts/dev-build.ps1` 直接调用 Visual Studio 自带的 MSVC 与 Ninja 完成配置和构建。
 

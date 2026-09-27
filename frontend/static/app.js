@@ -911,10 +911,13 @@ function createExpressionCell(text, latex) {
   return cell;
 }
 
-function formatNumber(value) {
+function formatNumber(value, preservePrecision = false) {
   if (value === null || value === undefined) return "—";
   const number = Number(value);
   if (!Number.isFinite(number)) return String(value);
+  // A root close to a large target must not round back to that target in the
+  // table. The shortest round-trip string preserves every bit sent by Fates.
+  if (preservePrecision) return number.toString();
   const absolute = Math.abs(number);
   if ((absolute > 0 && absolute < 1e-4) || absolute >= 1e7) return number.toExponential(6);
   return Number(number.toPrecision(13)).toString();
@@ -955,7 +958,8 @@ function renderSearchRows(table, data) {
     const numericValues = equations
       ? [row.estimated_root, row.signed_error, row.absolute_error, row.residual_at_target]
       : [row.value, row.signed_error, row.absolute_error, row.relative_error];
-    numericValues.forEach((value) => tableRow.append(createCell(formatNumber(value))));
+    numericValues.forEach((value, index) =>
+      tableRow.append(createCell(formatNumber(value, equations && index === 0))));
     body.append(tableRow);
   });
   table.querySelector("tbody").replaceChildren(body);

@@ -409,6 +409,8 @@ struct Candidate {
     NodeTag tag{NodeTag::Atom};
     std::uint8_t op{};
     bool depends_on_x{};
+
+    bool operator==(const Candidate&) const = default;
 };
 
 static_assert(sizeof(Node) <= 64, "Node error bound must not grow the layout past one cache line");
@@ -810,6 +812,8 @@ static std::uint64_t candidate_shape_signature(const Candidate& candidate) {
 }
 
 class CandidateCollector {
+    using TableEntry = FastMap<std::uint64_t, Candidate>::value_type;
+
 public:
     struct KeyedCandidate {
         std::uint64_t key{};
@@ -868,6 +872,10 @@ public:
         if (pareto_slots_ <= 1) return;
         const auto key = state_bucket(candidate.value, candidate.derivative, candidate.depends_on_x,
                                       candidate.constraint_state, value_bits_, derivative_sensitive_);
+        consider_extra_with_key(candidate, key);
+    }
+
+    void consider_extra_only_with_key(const Candidate& candidate, std::uint64_t key) {
         consider_extra_with_key(candidate, key);
     }
 
@@ -999,7 +1007,8 @@ private:
     }
 
     std::uint64_t extra_key(const Candidate& candidate, std::uint64_t state_key) const {
-        const std::uint64_t slot = candidate_shape_signature(candidate) % (pareto_slots_ - 1U);
+        const std::uint64_t slot = pareto_slots_ == 2
+            ? 0 : candidate_shape_signature(candidate) % (pareto_slots_ - 1U);
         return mix64(state_key ^ (0x9e3779b97f4a7c15ULL * (slot + 1U)));
     }
 
@@ -1021,24 +1030,53 @@ private:
         cap = std::max<std::size_t>(1, cap);
         if (extra_table_.size() <= cap) return;
 
-        std::vector<Candidate> all;
+        // Rank compact records, not whole expressions. Entries remain stable
+        // until selection finishes; copy only survivors, with their known keys.
+        // Keep scratch per worker rather than per archive shard. This operation
+        // is not re-entrant and primary pruning has a separate scratch set.
+        struct Rank {
+            double value{};
+            double error{};
+            std::uint64_t hash{};
+            std::uint32_t complexity{};
+            std::uint32_t index{};
+        };
+        static_assert(sizeof(Rank) == 32);
+        struct Scratch {
+            std::vector<Rank> all;
+            std::vector<const TableEntry*> entries;
+            std::vector<KeyedCandidate> keep;
+        };
+        static thread_local Scratch scratch;
+        auto& all = scratch.all;
+        all.clear();
         all.reserve(extra_table_.size());
-        for (const auto& [_, candidate] : extra_table_) all.push_back(candidate);
+        auto& entries = scratch.entries;
+        entries.clear();
+        entries.reserve(extra_table_.size());
+        if (extra_table_.size() > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::length_error("结构候选裁剪索引超过 32 位上限");
+        }
+        for (const auto& entry : extra_table_) {
+            const Candidate& candidate = entry.second;
+            all.push_back({candidate.value, abs_error(candidate.value, target_), candidate.hash,
+                           (static_cast<std::uint32_t>(candidate.nodes) << 16U) | candidate.depth,
+                           static_cast<std::uint32_t>(entries.size())});
+            entries.push_back(&entry);
+        }
         const double scale = std::max(1.0, std::abs(target_));
         const double precision_floor = std::ldexp(scale, -static_cast<int>(value_bits_));
-        const auto elegance_order = [&](const Candidate& a, const Candidate& b) {
-            const double ea = abs_error(a.value, target_);
-            const double eb = abs_error(b.value, target_);
-            const bool a_equivalent = ea <= precision_floor;
-            const bool b_equivalent = eb <= precision_floor;
+        const auto elegance_order = [&](const Rank& a, const Rank& b) {
+            const bool a_equivalent = a.error <= precision_floor;
+            const bool b_equivalent = b.error <= precision_floor;
             if (a_equivalent != b_equivalent) return a_equivalent;
-            if (a.nodes != b.nodes) return a.nodes < b.nodes;
-            if (a.depth != b.depth) return a.depth < b.depth;
-            if (ea != eb) return ea < eb;
+            if (a.complexity != b.complexity) return a.complexity < b.complexity;
+            if (a.error != b.error) return a.error < b.error;
             return a.hash < b.hash;
         };
 
-        std::vector<Candidate> keep;
+        auto& keep = scratch.keep;
+        keep.clear();
         keep.reserve(cap);
         const std::size_t elegant_count = std::min(cap, std::max<std::size_t>(1, cap / 2));
         if (elegant_count < all.size()) {
@@ -1046,10 +1084,13 @@ private:
                              all.begin() + static_cast<std::ptrdiff_t>(elegant_count),
                              all.end(), elegance_order);
         }
-        keep.insert(keep.end(), all.begin(), all.begin() + static_cast<std::ptrdiff_t>(elegant_count));
+        for (std::size_t i = 0; i < elegant_count; ++i) {
+            const TableEntry& entry = *entries[all[i].index];
+            keep.push_back({entry.first, entry.second});
+        }
 
         sort_range(all.begin() + static_cast<std::ptrdiff_t>(elegant_count), all.end(),
-                   [](const Candidate& a, const Candidate& b) {
+                   [](const Rank& a, const Rank& b) {
                       if (a.value != b.value) return a.value < b.value;
                       return a.hash < b.hash;
                   });
@@ -1059,18 +1100,15 @@ private:
             const std::size_t position = spread_count == 1
                 ? rest_size / 2
                 : (i * (rest_size - 1)) / (spread_count - 1);
-            keep.push_back(all[elegant_count + position]);
+            const TableEntry& entry = *entries[all[elegant_count + position].index];
+            keep.push_back({entry.first, entry.second});
         }
 
         extra_table_.clear();
         extra_table_.reserve(cap * 2 + 1);
-        for (const Candidate& candidate : keep) {
-            const auto state_key = state_bucket(candidate.value, candidate.derivative,
-                                                candidate.depends_on_x, candidate.constraint_state,
-                                                value_bits_, derivative_sensitive_);
-            const auto key = extra_key(candidate, state_key);
-            const auto [it, inserted] = extra_table_.try_emplace(key, candidate);
-            if (!inserted && more_elegant(candidate, it->second)) it->second = candidate;
+        for (const KeyedCandidate& entry : keep) {
+            // These entries came from extra_table_, so keys are already unique.
+            extra_table_.emplace(entry.key, entry.candidate);
         }
     }
 
@@ -1095,20 +1133,32 @@ private:
             double value{};
             double error{};
         };
-        std::vector<Entry> all;
+        using Index = std::uint32_t;
+        struct Scratch {
+            std::vector<Entry> all;
+            std::vector<RankValue> rank_values;
+            std::vector<Index> order;
+            std::vector<unsigned char> selected;
+            std::vector<Index> keep_indices;
+            std::vector<Index> rest;
+        };
+        static thread_local Scratch scratch;
+        auto& all = scratch.all;
+        all.clear();
         all.reserve(table_.size());
-        std::vector<RankValue> rank_values;
+        auto& rank_values = scratch.rank_values;
+        rank_values.clear();
         rank_values.reserve(table_.size());
         for (const auto& [key, candidate] : table_) {
             all.push_back({key, candidate});
             rank_values.push_back({candidate.value, abs_error(candidate.value, target_)});
         }
 
-        using Index = std::uint32_t;
         if (all.size() > std::numeric_limits<Index>::max()) {
             throw std::length_error("候选裁剪索引超过 32 位上限");
         }
-        std::vector<Index> order(all.size());
+        auto& order = scratch.order;
+        order.resize(all.size());
         for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<Index>(i);
         const auto near_better = [&](Index i, Index j) {
             const Candidate& a = all[i].candidate;
@@ -1132,15 +1182,18 @@ private:
         }
         sort_range(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(near_count), near_better);
 
-        std::vector<unsigned char> selected(all.size(), 0);
-        std::vector<Index> keep_indices;
+        auto& selected = scratch.selected;
+        selected.assign(all.size(), 0);
+        auto& keep_indices = scratch.keep_indices;
+        keep_indices.clear();
         keep_indices.reserve(cap);
         for (std::size_t k = 0; k < near_count; ++k) {
             selected[order[k]] = 1;
             keep_indices.push_back(order[k]);
         }
 
-        std::vector<Index> rest;
+        auto& rest = scratch.rest;
+        rest.clear();
         rest.reserve(all.size() - near_count);
         for (std::size_t i = 0; i < all.size(); ++i) {
             if (!selected[i]) rest.push_back(static_cast<Index>(i));
@@ -2644,10 +2697,46 @@ struct TaskResult {
     std::vector<std::uint64_t> keys;
     std::array<std::uint32_t, kMergeShards + 1> shard_offsets{};
     std::vector<Candidate> extra_candidates;
+    std::vector<std::uint64_t> extra_keys;
+    std::array<std::uint32_t, kMergeShards + 1> extra_shard_offsets{};
     std::uint64_t attempted{};
     std::uint64_t valid{};
 
     std::size_t size() const { return candidates.size(); }
+
+    // Stable counting partition: each shard sees extras in precisely the same
+    // value/task order as the old serial pass. Do this on the generating worker
+    // so neither routing nor extra-key calculation serializes the merge.
+    void shard_extras(unsigned value_bits, bool derivative_sensitive) {
+        const std::size_t count = extra_candidates.size();
+        extra_shard_offsets.fill(0);
+        extra_keys.clear();
+        if (count == 0) return;
+        if (count > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::length_error("单个任务的结构候选数超过 32 位上限");
+        }
+        std::vector<std::uint64_t> original_keys;
+        original_keys.reserve(count);
+        for (const Candidate& candidate : extra_candidates) {
+            const auto key = state_bucket(candidate.value, candidate.derivative, candidate.depends_on_x,
+                                          candidate.constraint_state, value_bits, derivative_sensitive);
+            original_keys.push_back(key);
+            ++extra_shard_offsets[merge_shard_of(key) + 1];
+        }
+        for (std::size_t shard = 0; shard < kMergeShards; ++shard) {
+            extra_shard_offsets[shard + 1] += extra_shard_offsets[shard];
+        }
+        auto positions = extra_shard_offsets;
+        auto original = std::move(extra_candidates);
+        extra_candidates.resize(count);
+        extra_keys.resize(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto key = original_keys[i];
+            const std::size_t position = positions[merge_shard_of(key)]++;
+            extra_candidates[position] = original[i];
+            extra_keys[position] = key;
+        }
+    }
 };
 
 static std::optional<double> desired_right(BinaryKind kind, double left, double target) {
@@ -2861,6 +2950,7 @@ public:
     ParallelExecutor(const ParallelExecutor&) = delete;
     ParallelExecutor& operator=(const ParallelExecutor&) = delete;
 
+
     ~ParallelExecutor() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -2885,14 +2975,19 @@ public:
         next_.store(0, std::memory_order_relaxed);
         failed_.store(false, std::memory_order_relaxed);
         error_ = nullptr;
-        pending_workers_ = workers_.size();
+        accepting_workers_ = true;
         ++generation_;
         start_.notify_all();
 
         lock.unlock();
         execute_available_tasks();
         lock.lock();
-        done_.wait(lock, [this] { return pending_workers_ == 0; });
+        // Every task is now claimed (or the batch failed). Workers that have
+        // not joined this generation need not wake up just to acknowledge it.
+        // Close admission under the same lock they use to join, then wait for
+        // all joined workers to leave the task function before releasing it.
+        accepting_workers_ = false;
+        done_.wait(lock, [this] { return running_workers_ == 0; });
         const std::exception_ptr error = error_;
         task_ = {};
         lock.unlock();
@@ -2930,12 +3025,14 @@ private:
             start_.wait(lock, [&] { return stopping_ || generation_ != observed_generation; });
             if (stopping_) return;
             observed_generation = generation_;
+            if (!accepting_workers_) continue;
+            ++running_workers_;
             lock.unlock();
 
             execute_available_tasks();
 
             lock.lock();
-            if (--pending_workers_ == 0) done_.notify_one();
+            if (--running_workers_ == 0) done_.notify_one();
         }
     }
 
@@ -2948,7 +3045,8 @@ private:
     std::atomic<std::size_t> next_{0};
     std::atomic<bool> failed_{false};
     std::size_t task_count_{};
-    std::size_t pending_workers_{};
+    std::size_t running_workers_{};
+    bool accepting_workers_{false};
     std::size_t generation_{};
     std::exception_ptr error_;
     bool stopping_{false};
@@ -3044,6 +3142,13 @@ public:
                 sink.consider_with_key(result.candidates[i], result.keys[i]);
             }
         }
+        // All primary candidates precede all explicit extras, as in the serial
+        // merge. Interleaving the two per task would change Pareto pruning.
+        if (pareto_slots_ > 1) {
+            for (const std::uint32_t index : task_indices) {
+                absorb_extra_shard(results[index], shard);
+            }
+        }
     }
 
     void absorb_shard(const std::vector<TaskResult>& results, std::size_t shard) {
@@ -3055,6 +3160,9 @@ public:
                 sink.consider_with_key(result.candidates[i], result.keys[i]);
             }
         }
+        if (pareto_slots_ > 1) {
+            for (const TaskResult& result : results) absorb_extra_shard(result, shard);
+        }
     }
 
     // Merge every shard of every task result.  Waking the worker pool costs
@@ -3062,19 +3170,13 @@ public:
     // small batches stay on the calling thread.
     void absorb(const std::vector<TaskResult>& results, ParallelExecutor& executor) {
         std::size_t total = 0;
-        for (const TaskResult& result : results) total += result.candidates.size();
+        for (const TaskResult& result : results) {
+            total += result.candidates.size() + result.extra_candidates.size();
+        }
         if (total < kParallelMergeThreshold) {
             for (std::size_t shard = 0; shard < kMergeShards; ++shard) absorb_shard(results, shard);
         } else {
             executor.run(kMergeShards, [&](std::size_t shard) { absorb_shard(results, shard); });
-        }
-        absorb_extras(results);
-    }
-
-    void absorb_extras(const std::vector<TaskResult>& results) {
-        if (pareto_slots_ <= 1) return;
-        for (const TaskResult& result : results) {
-            for (const Candidate& candidate : result.extra_candidates) consider_extra_only(candidate);
         }
     }
 
@@ -3104,6 +3206,15 @@ public:
     }
 
 private:
+    void absorb_extra_shard(const TaskResult& result, std::size_t shard) {
+        CandidateCollector& sink = shards_[shard];
+        const std::uint32_t begin = result.extra_shard_offsets[shard];
+        const std::uint32_t end = result.extra_shard_offsets[shard + 1];
+        for (std::uint32_t i = begin; i < end; ++i) {
+            sink.consider_extra_only_with_key(result.extra_candidates[i], result.extra_keys[i]);
+        }
+    }
+
     struct DrainedShard {
         std::vector<Candidate> candidates;
         std::vector<std::uint64_t> keys;
@@ -3251,15 +3362,7 @@ struct SearchStats {
     double pslq_seconds{};
     double mcts_seconds{};
     double genetic_seconds{};
-};
-
-struct SearchRun {
-    Config cfg;
-    std::vector<AtomSpec> atoms;
-    std::vector<Node> arena;
-    std::vector<std::vector<ExprId>> layers;
-    std::vector<std::vector<ExprId>> extra_layers;
-    SearchStats stats;
+    double equation_seconds{};
 };
 
 struct EquationMatch {
@@ -3270,6 +3373,20 @@ struct EquationMatch {
     double residual{};
     unsigned cost{};
     unsigned nodes{};
+
+    bool operator==(const EquationMatch&) const = default;
+};
+
+struct SearchRun {
+    Config cfg;
+    std::vector<AtomSpec> atoms;
+    std::vector<Node> arena;
+    std::vector<std::vector<ExprId>> layers;
+    std::vector<std::vector<ExprId>> extra_layers;
+    SearchStats stats;
+    // A completed equation run owns its final ranking. Printing must not repeat
+    // millions of root refinements on the same immutable arena.
+    std::optional<std::vector<EquationMatch>> equation_matches;
 };
 
 static bool equation_better(const EquationMatch& a, const EquationMatch& b) {
@@ -3282,7 +3399,8 @@ static bool equation_better(const EquationMatch& a, const EquationMatch& b) {
 
 static std::vector<EquationMatch> collect_equation_matches(const Config& cfg,
                                                            const std::vector<Node>& arena,
-                                                           std::size_t limit);
+                                                           std::size_t limit,
+                                                           ParallelExecutor* executor = nullptr);
 static std::string render_expression_text(const std::vector<AtomSpec>& atoms,
                                           const std::vector<Node>& arena,
                                           ExprId id);
@@ -3338,6 +3456,8 @@ public:
             if (!inserted && more_elegant(candidate, found->second)) found->second = candidate;
         }
 
+        if (local_bucket_best.empty()) return;
+
         std::vector<Candidate> local;
         local.reserve(std::min(capacity_, local_bucket_best.size()));
         auto heap_compare = [&](const Candidate& a, const Candidate& b) { return better(a, b); };
@@ -3369,6 +3489,12 @@ public:
         std::sort(merged.begin(), merged.end(), [&](const Candidate& a, const Candidate& b) {
             return better(a, b);
         });
+
+        // A full unchanged prefix already has distinct formulas, as checked
+        // when best_ was installed. Worse entries cannot displace it. Require
+        // equality of every candidate field, not just its expression hash.
+        if (best_.size() == capacity_ && merged.size() >= capacity_ &&
+            std::equal(best_.begin(), best_.end(), merged.begin())) return;
 
         std::vector<Candidate> next;
         next.reserve(std::min(capacity_, merged.size()));
@@ -3608,6 +3734,7 @@ public:
         stats_.used_exploration = cfg_.explore_pairs > 0;
         stats_.used_portfolio = cfg_.portfolio;
         auto last_equation_live = all_start;
+        std::optional<std::vector<EquationMatch>> final_equations;
         const unsigned generation_limit = generation_cost_limit();
         bool stopped_on_epsilon = false;
         double best_error = std::numeric_limits<double>::infinity();
@@ -3721,9 +3848,19 @@ public:
                 const auto now = std::chrono::steady_clock::now();
                 if (cost == generation_limit ||
                     std::chrono::duration<double>(now - last_equation_live).count() >= cfg_.live_interval) {
-                    const auto matches = collect_equation_matches(cfg_, arena_, cfg_.live_top);
+                    const auto match_start = std::chrono::steady_clock::now();
+                    auto matches = collect_equation_matches(
+                        cfg_, arena_, cost == generation_limit
+                            ? std::max(cfg_.live_top, cfg_.results) : cfg_.live_top, &executor_);
+                    const auto match_end = std::chrono::steady_clock::now();
+                    stats_.equation_seconds += std::chrono::duration<double>(match_end - match_start).count();
+                    if (cost == generation_limit) {
+                        final_equations = matches;
+                        if (final_equations->size() > cfg_.results) final_equations->resize(cfg_.results);
+                    }
+                    if (matches.size() > cfg_.live_top) matches.resize(cfg_.live_top);
                     std::ostringstream out;
-                    const double elapsed = std::chrono::duration<double>(now - all_start).count();
+                    const double elapsed = std::chrono::duration<double>(match_end - all_start).count();
                     if (cfg_.live_json) {
                         out << "[fates-live] {\"type\":\"equations\",\"cost\":" << cost
                             << ",\"total_cost\":" << cfg_.max_cost
@@ -3775,7 +3912,7 @@ public:
                     }
                         std::cerr << out.str() << std::flush;
                     }
-                    last_equation_live = now;
+                    last_equation_live = match_end;
                 }
             }
 
@@ -3796,7 +3933,7 @@ public:
         }
 
         stats_.deterministic_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - all_start).count();
+            std::chrono::steady_clock::now() - all_start).count() - stats_.equation_seconds;
         stats_.generated_cost = stats_.completed_cost;
         if (cfg_.bidirectional && !stopped_on_epsilon && generation_limit < cfg_.max_cost) {
             stats_.used_mitm = true;
@@ -3845,9 +3982,15 @@ public:
                 std::chrono::steady_clock::now() - stage_start).count();
         }
 
+        if (cfg_.equations && !final_equations) {
+            const auto match_start = std::chrono::steady_clock::now();
+            final_equations = collect_equation_matches(cfg_, arena_, cfg_.results, &executor_);
+            stats_.equation_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - match_start).count();
+        }
         stats_.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - all_start).count();
         return SearchRun{std::move(cfg_), std::move(atoms_), std::move(arena_), std::move(layers_),
-                         std::move(extra_layers_), std::move(stats_)};
+                         std::move(extra_layers_), std::move(stats_), std::move(final_equations)};
     }
 
 private:
@@ -4991,7 +5134,9 @@ private:
             }
 
             std::size_t batch_candidates = 0;
-            for (const TaskResult& result : results) batch_candidates += result.candidates.size();
+            for (const TaskResult& result : results) {
+                batch_candidates += result.candidates.size() + result.extra_candidates.size();
+            }
             const auto merge_unit = [&](std::size_t unit) {
                 const std::size_t cost_index = unit / kMergeShards;
                 const std::size_t shard = unit % kMergeShards;
@@ -5003,16 +5148,6 @@ private:
             } else {
                 executor_.run(merge_units, merge_unit);
             }
-            if (cfg_.pareto_slots > 1) {
-                for (std::size_t index = 0; index < batch_archives.size(); ++index) {
-                    for (const std::uint32_t task_index : batch_cost_tasks[index]) {
-                        for (const Candidate& candidate : results[task_index].extra_candidates) {
-                            batch_archives[index]->consider_extra_only(candidate);
-                        }
-                    }
-                }
-            }
-
             const double batch_seconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - batch_start).count();
             if (!batch_costs.empty()) {
@@ -5260,6 +5395,7 @@ private:
         }
         collector.take_sharded(cap, result.candidates, result.keys, result.shard_offsets);
         result.extra_candidates = collector.take_extras(pareto_extra_cap());
+        result.shard_extras(state_value_bits(cfg_), false);
         return result;
     }
 
@@ -5397,6 +5533,7 @@ private:
                         local.take_sharded(deep_cap, result.candidates, result.keys,
                                            result.shard_offsets);
                         result.extra_candidates = local.take_extras(pareto_extra_cap());
+                        result.shard_extras(state_value_bits(cfg_), false);
                     });
                     merge_deep_results(collectors, total_cost, results);
                 }
@@ -7188,6 +7325,7 @@ private:
             collector.take_sharded(std::max<std::size_t>(cfg_.beam, 256), result.candidates,
                                    result.keys, result.shard_offsets);
             result.extra_candidates = collector.take_extras(pareto_extra_cap());
+            result.shard_extras(state_value_bits(cfg_), cfg_.equations);
             return result;
         }
 
@@ -7341,6 +7479,7 @@ private:
         collector.take_sharded(std::max<std::size_t>(cfg_.beam, 256), result.candidates,
                                result.keys, result.shard_offsets);
         result.extra_candidates = collector.take_extras(pareto_extra_cap());
+        result.shard_extras(state_value_bits(cfg_), cfg_.equations);
         return result;
     }
 
@@ -7747,26 +7886,13 @@ static std::string render_candidate_latex(const std::vector<AtomSpec>& atoms,
     return render_node_latex(atoms, arena, node).text;
 }
 
-// Re-evaluate a variable-dependent AST at a nearby point.  Equation mode
-// stores only f(T) and f'(T) in the hot search path; this slow, bounded helper
-// is called only for the small set of equation pairs that survived numeric
-// matching.  Constant subtrees reuse their stored value, which keeps probes
-// cheap even for large expressions.
-static std::optional<double> evaluate_equation_node(const Config& cfg,
-                                                    const std::vector<Node>& arena,
-                                                    ExprId id,
-                                                    double variable) {
-    const Node& node = arena[id];
-    if (!node.depends_on_x) return node.value;
-
-    if (node.tag == NodeTag::Atom) {
-        return variable;
-    }
-
+// Shared operation/domain semantics for recursive root probes and the fixed
+// neighbourhood cache. Children have already been evaluated by the caller.
+static std::optional<double> evaluate_equation_operation(const Config& cfg,
+                                                        const Node& node,
+                                                        double x,
+                                                        double y = 0.0) {
     if (node.tag == NodeTag::Unary) {
-        const auto child_value = evaluate_equation_node(cfg, arena, node.left, variable);
-        if (!child_value) return std::nullopt;
-        const double x = *child_value;
         double value = 0.0;
         const auto kind = static_cast<UnaryKind>(node.op);
         switch (kind) {
@@ -7867,11 +7993,8 @@ static std::optional<double> evaluate_equation_node(const Config& cfg,
         return valid_numeric(value, cfg) ? std::optional<double>{value} : std::nullopt;
     }
 
-    const auto left_value = evaluate_equation_node(cfg, arena, node.left, variable);
-    const auto right_value = evaluate_equation_node(cfg, arena, node.right, variable);
-    if (!left_value || !right_value) return std::nullopt;
-    const double a = *left_value;
-    const double b = *right_value;
+    const double a = x;
+    const double b = y;
     double value = 0.0;
     const auto kind = static_cast<BinaryKind>(node.op);
     switch (kind) {
@@ -7911,6 +8034,20 @@ static std::optional<double> evaluate_equation_node(const Config& cfg,
     return valid_numeric(value, cfg) ? std::optional<double>{value} : std::nullopt;
 }
 
+static std::optional<double> evaluate_equation_node(const Config& cfg,
+                                                    const std::vector<Node>& arena,
+                                                    ExprId id,
+                                                    double variable) {
+    const Node& node = arena[id];
+    if (!node.depends_on_x) return node.value;
+    if (node.tag == NodeTag::Atom) return variable;
+    const auto left = evaluate_equation_node(cfg, arena, node.left, variable);
+    if (!left) return std::nullopt;
+    if (node.tag == NodeTag::Unary) return evaluate_equation_operation(cfg, node, *left);
+    const auto right = evaluate_equation_node(cfg, arena, node.right, variable);
+    return right ? evaluate_equation_operation(cfg, node, *left, *right) : std::nullopt;
+}
+
 static std::optional<double> evaluate_equation_residual(const Config& cfg,
                                                         const std::vector<Node>& arena,
                                                         ExprId left,
@@ -7923,29 +8060,235 @@ static std::optional<double> evaluate_equation_residual(const Config& cfg,
     return valid_numeric(residual, cfg) ? std::optional<double>{residual} : std::nullopt;
 }
 
-// Number of ulps of the operand magnitude below which a residual carries no
-// information: at that separation the two sides round to the same double, so
-// `L - R` says nothing about whether L and R are mathematically equal.
+// Every pair uses the same four stability probes. Evaluate the append-only DAG
+// once per point, not once per pair; a cached invalid value stays invalid.
+class EquationProbeCache {
+public:
+    EquationProbeCache(const Config& cfg, const std::vector<Node>& arena) : cfg_(cfg) {
+        if (cfg.equation_quality == EquationQualityMode::Off) return;
+        values_.resize(arena.size());
+        const double h = std::clamp(1.0e-5 * std::max(1.0, std::abs(cfg.target)), 1.0e-7, 5.0e-2);
+        const std::array<double, 4> points{cfg.target - h, cfg.target + h,
+                                          cfg.target - 1.0, cfg.target + 1.0};
+        const std::size_t probes = cfg.equation_quality == EquationQualityMode::Strict ? 4 : 2;
+        const double invalid = std::numeric_limits<double>::quiet_NaN();
+        for (std::size_t id = 0; id < arena.size(); ++id) {
+            const Node& node = arena[id];
+            for (std::size_t probe = 0; probe < probes; ++probe) {
+                double value = invalid;
+                if (!node.depends_on_x) value = node.value;
+                else if (node.tag == NodeTag::Atom) value = points[probe];
+                else {
+                    const double left = values_[node.left][probe];
+                    const double right = node.tag == NodeTag::Binary ? values_[node.right][probe] : 0.0;
+                    if (std::isfinite(left) && std::isfinite(right)) {
+                        value = evaluate_equation_operation(cfg, node, left, right).value_or(invalid);
+                    }
+                }
+                values_[id][probe] = value;
+            }
+        }
+    }
+
+    std::optional<double> residual(ExprId left, ExprId right, std::size_t probe) const {
+        const double value = values_[left][probe] - values_[right][probe];
+        return valid_numeric(value, cfg_) ? std::optional<double>{value} : std::nullopt;
+    }
+
+private:
+    const Config& cfg_;
+    std::vector<std::array<double, 4>> values_;
+};
+
+// Conservative operand-scale floor for the isolation probes. This is NOT a
+// root-convergence tolerance: root accuracy also depends on the derivative.
 inline constexpr double kResidualNoiseUlps = 128.0;
+
+struct EquationValue {
+    double value{};
+    double error{};
+    double derivative{};
+};
+
+// Root probes must carry the errors of the whole expression, not just
+// the final subtraction. For example, inv(gamma + inv(x) - gamma) is x in real
+// arithmetic, but cancellation followed by inv amplifies rounding by x*x.
+// Analytic derivatives also avoid differencing two already-cancelled residuals.
+// This evaluator is only used by equation matching, never by expression search.
+static std::optional<EquationValue> evaluate_equation_with_error(const Config& cfg,
+                                                               const std::vector<Node>& arena,
+                                                               ExprId id,
+                                                               double variable) {
+    const Node& node = arena[id];
+    if (!node.depends_on_x) return EquationValue{node.value, node.error, 0.0};
+    if (node.tag == NodeTag::Atom) return EquationValue{variable, 0.0, 1.0};
+    const auto left = evaluate_equation_with_error(cfg, arena, node.left, variable);
+    if (!left) return std::nullopt;
+    const auto right = node.tag == NodeTag::Binary
+        ? evaluate_equation_with_error(cfg, arena, node.right, variable)
+        : std::optional<EquationValue>{EquationValue{}};
+    if (!right) return std::nullopt;
+    const auto evaluated = evaluate_equation_operation(cfg, node, left->value, right->value);
+    if (!evaluated) return std::nullopt;
+    const double value = *evaluated;
+    double error = rounding_error(value);
+    double derivative = std::numeric_limits<double>::quiet_NaN();
+    if (node.tag == NodeTag::Unary) {
+        const double x = left->value;
+        const double dx = left->derivative;
+        const auto kind = static_cast<UnaryKind>(node.op);
+        switch (kind) {
+            case UnaryKind::Neg: derivative = -dx; error = 0.0; break;
+            case UnaryKind::Abs: derivative = x < 0.0 ? -dx : dx; error = 0.0; break;
+            case UnaryKind::Inv: derivative = -dx / (x * x); break;
+            case UnaryKind::Sqrt:
+                if (value != 0.0) derivative = dx / (2.0 * value);
+                break;
+            case UnaryKind::Cbrt:
+                if (value != 0.0) derivative = dx / (3.0 * value * value);
+                break;
+            case UnaryKind::Sqr: derivative = 2.0 * x * dx; break;
+            case UnaryKind::Cube: derivative = 3.0 * x * x * dx; break;
+            case UnaryKind::Ln: derivative = dx / x; break;
+            case UnaryKind::Log10: derivative = dx / (x * std::numbers::ln10_v<double>); break;
+            case UnaryKind::Exp: derivative = value * dx; break;
+            case UnaryKind::Sin: derivative = std::cos(x) * dx; break;
+            case UnaryKind::Cos: derivative = -std::sin(x) * dx; break;
+            case UnaryKind::Tan: derivative = (1.0 + value * value) * dx; break;
+            case UnaryKind::Asin:
+                if (std::abs(x) != 1.0) derivative = dx / std::sqrt(1.0 - x * x);
+                break;
+            case UnaryKind::Acos:
+                if (std::abs(x) != 1.0) derivative = -dx / std::sqrt(1.0 - x * x);
+                break;
+            case UnaryKind::Atan: derivative = dx / (1.0 + x * x); break;
+            case UnaryKind::Sinh: derivative = std::cosh(x) * dx; break;
+            case UnaryKind::Cosh: derivative = std::sinh(x) * dx; break;
+            case UnaryKind::Tanh: derivative = (1.0 - value * value) * dx; break;
+            case UnaryKind::Asinh: derivative = dx / std::sqrt(1.0 + x * x); break;
+            case UnaryKind::Acosh:
+                if (x != 1.0) derivative = dx / (std::sqrt(x - 1.0) * std::sqrt(x + 1.0));
+                break;
+            case UnaryKind::Atanh: derivative = dx / (1.0 - x * x); break;
+            case UnaryKind::Gamma: derivative = value * digamma(x) * dx; break;
+            case UnaryKind::Fact: break;
+            default: {
+                const auto custom = custom_unary_index(kind);
+                const auto& operation = extension_registry().unary_operations()[*custom];
+                if (operation.derivative) derivative = operation.derivative(x, value, dx);
+                break;
+            }
+        }
+        if (left->error != 0.0) {
+            const auto custom = custom_unary_index(kind);
+            const double slope = custom && extension_registry().unary_operations()[*custom].derivative
+                ? std::abs(extension_registry().unary_operations()[*custom].derivative(left->value, value, 1.0))
+                : unary_slope_bound(kind, left->value, value);
+            error += slope * left->error;
+        }
+    } else {
+        const double a = left->value;
+        const double b = right->value;
+        const double da = left->derivative;
+        const double db = right->derivative;
+        const auto kind = static_cast<BinaryKind>(node.op);
+        switch (kind) {
+            case BinaryKind::Add: derivative = da + db; break;
+            case BinaryKind::Sub: derivative = da - db; break;
+            case BinaryKind::Mul: derivative = da * b + a * db; break;
+            case BinaryKind::Div: derivative = (da * b - a * db) / (b * b); break;
+            case BinaryKind::Pow:
+                if (a > 0.0) derivative = value * (db * std::log(a) + b * da / a);
+                else if (!arena[node.right].depends_on_x) derivative = b * std::pow(a, b - 1.0) * da;
+                // These powers are exact before propagating input uncertainty.
+                // In particular, x = x^x really touches at x=1; its zero must
+                // not be confused with a rounded plateau near that point.
+                if (a == 1.0 || b == 0.0 || b == 1.0) error = 0.0;
+                break;
+            default: {
+                const auto custom = custom_binary_index(kind);
+                const auto& operation = extension_registry().binary_operations()[*custom];
+                if (operation.derivative) derivative = operation.derivative(a, b, value, da, db);
+                break;
+            }
+        }
+        if (left->error != 0.0 || right->error != 0.0) {
+            switch (kind) {
+                case BinaryKind::Add:
+                case BinaryKind::Sub:
+                    error += left->error + right->error;
+                    break;
+                case BinaryKind::Mul:
+                    error += std::abs(a) * right->error + std::abs(b) * left->error;
+                    break;
+                case BinaryKind::Div:
+                    error += (left->error + std::abs(value) * right->error) / std::abs(b);
+                    break;
+                case BinaryKind::Pow:
+                    if (a != 0.0) error += std::abs(value * b / a) * left->error;
+                    if (right->error != 0.0 && a > 0.0) error += std::abs(value * std::log(a)) * right->error;
+                    break;
+                default: {
+                    const auto custom = custom_binary_index(kind);
+                    const auto& operation = extension_registry().binary_operations()[*custom];
+                    if (operation.derivative) {
+                        error += std::abs(operation.derivative(a, b, value, 1.0, 0.0)) * left->error;
+                        error += std::abs(operation.derivative(a, b, value, 0.0, 1.0)) * right->error;
+                    } else {
+                        error += std::max(a == 0.0 ? 0.0 : left->error / std::abs(a),
+                                          b == 0.0 ? 0.0 : right->error / std::abs(b)) * std::abs(value);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    if (!std::isfinite(error)) return std::nullopt;
+    return EquationValue{value, error, derivative};
+}
 
 struct EquationSample {
     double residual{};
     double noise_floor{};
+    double operand_noise_floor{};
+    double derivative{};
+    double roundoff{};
 };
+
+static std::optional<EquationSample> make_equation_sample(const Config& cfg,
+                                                         const EquationValue& left,
+                                                         const EquationValue& right) {
+    const double residual = left.value - right.value;
+    if (!valid_numeric(residual, cfg)) return std::nullopt;
+    const double scale = std::max(std::abs(left.value), std::abs(right.value));
+    const double operand_noise = kResidualNoiseUlps * std::numeric_limits<double>::epsilon() * scale;
+    // This is an uncertainty in f(x), not a tolerance in x. Near a shallow
+    // crossing even a tiny residual can represent a large root-position error.
+    const double roundoff = 8.0 * (left.error + right.error + rounding_error(residual));
+    const double noise = std::max(operand_noise, roundoff);
+    if (!std::isfinite(noise)) return std::nullopt;
+    return EquationSample{residual, noise, operand_noise, left.derivative - right.derivative, roundoff};
+}
 
 static std::optional<EquationSample> sample_equation(const Config& cfg,
                                                      const std::vector<Node>& arena,
                                                      ExprId left,
                                                      ExprId right,
                                                      double variable) {
-    const auto left_value = evaluate_equation_node(cfg, arena, left, variable);
-    const auto right_value = evaluate_equation_node(cfg, arena, right, variable);
+    const auto left_value = evaluate_equation_with_error(cfg, arena, left, variable);
+    const auto right_value = evaluate_equation_with_error(cfg, arena, right, variable);
     if (!left_value || !right_value) return std::nullopt;
-    const double residual = *left_value - *right_value;
-    if (!valid_numeric(residual, cfg)) return std::nullopt;
-    const double scale = std::max({1.0, std::abs(*left_value), std::abs(*right_value)});
-    return EquationSample{residual,
-                          kResidualNoiseUlps * std::numeric_limits<double>::epsilon() * scale};
+    return make_equation_sample(cfg, *left_value, *right_value);
+}
+
+static bool equation_root_converged(const EquationSample& sample, double root) {
+    if (sample.residual == 0.0 && sample.roundoff == 0.0) return true;
+    if (!std::isfinite(sample.derivative) || sample.derivative == 0.0) return false;
+    const double unit = std::numeric_limits<double>::epsilon() * std::max(1.0, std::abs(root));
+    // A few ulps for the last Newton step, plus a separate conservative budget
+    // for accumulated evaluation error. Neither depends on the sides' size.
+    return std::abs(sample.residual / sample.derivative) <= 4.0 * unit &&
+           sample.roundoff / std::abs(sample.derivative) <= 64.0 * unit;
 }
 
 // A root has to be an isolated zero of the residual, not a stretch where the
@@ -7967,7 +8310,7 @@ static bool equation_root_is_isolated(const Config& cfg,
     if (!std::isfinite(root)) return false;
 
     const auto at_root = sample_equation(cfg, arena, left, right, root);
-    if (!at_root || std::abs(at_root->residual) > at_root->noise_floor) return false;
+    if (!at_root || !equation_root_converged(*at_root, root)) return false;
 
     const double magnitude = std::max(1.0, std::abs(root));
     const double limit = 1.0e-2 * magnitude;
@@ -7989,7 +8332,8 @@ static bool equation_is_stable(const Config& cfg,
                                ExprId right,
                                double residual,
                                double slope,
-                               double root) {
+                               double root,
+                               const EquationProbeCache* probes = nullptr) {
     if (cfg.equation_quality == EquationQualityMode::Off) return true;
     if (!std::isfinite(slope) || !std::isfinite(root)) return false;
     const double slope_scale = std::max(1.0, std::abs(slope));
@@ -7999,8 +8343,10 @@ static bool equation_is_stable(const Config& cfg,
     // Small enough to test the actual local domain, but not so small that
     // double rounding at an integer masks a pole or a logarithm boundary.
     const double h = std::clamp(1.0e-5 * target_scale, 1.0e-7, 5.0e-2);
-    const auto minus = evaluate_equation_residual(cfg, arena, left, right, cfg.target - h);
-    const auto plus = evaluate_equation_residual(cfg, arena, left, right, cfg.target + h);
+    const auto minus = probes ? probes->residual(left, right, 0)
+        : evaluate_equation_residual(cfg, arena, left, right, cfg.target - h);
+    const auto plus = probes ? probes->residual(left, right, 1)
+        : evaluate_equation_residual(cfg, arena, left, right, cfg.target + h);
     if (!minus || !plus) return false;
 
     const double finite_difference = (*plus - *minus) / (2.0 * h);
@@ -8031,10 +8377,10 @@ static bool equation_is_stable(const Config& cfg,
     // catches ln(tan(pi*x)) at an integer where the rounded tan value happens
     // to be a tiny positive number although the mathematical expression is
     // undefined on one side.
-    const auto minus_one = evaluate_equation_residual(
-        cfg, arena, left, right, cfg.target - 1.0);
-    const auto plus_one = evaluate_equation_residual(
-        cfg, arena, left, right, cfg.target + 1.0);
+    const auto minus_one = probes ? probes->residual(left, right, 2)
+        : evaluate_equation_residual(cfg, arena, left, right, cfg.target - 1.0);
+    const auto plus_one = probes ? probes->residual(left, right, 3)
+        : evaluate_equation_residual(cfg, arena, left, right, cfg.target + 1.0);
     if (!minus_one || !plus_one) return false;
     const double periodic_scale = std::max({1.0, std::abs(*minus_one), std::abs(*plus_one),
                                              std::abs(residual), std::abs(slope)});
@@ -8047,6 +8393,44 @@ static bool equation_is_stable(const Config& cfg,
     return true;
 }
 
+// When Newton reaches the rounding plateau of a multiple root, f/f' is no
+// longer informative. Locate the stationary point with analytic f' instead,
+// but accept it only when the original equation evaluates to an exact zero
+// with zero propagated uncertainty. A merely small positive minimum is not a
+// root. This keeps representable tangencies such as x=x^x at one.
+static std::optional<double> refine_exact_equation_tangency(const Config& cfg,
+                                                           const std::vector<Node>& arena,
+                                                           ExprId left,
+                                                           ExprId right,
+                                                           double root,
+                                                           EquationSample current) {
+    for (unsigned iteration = 0; iteration < 8; ++iteration) {
+        if (current.residual == 0.0 && current.roundoff == 0.0) return root;
+        if (!std::isfinite(current.derivative) || std::abs(current.residual) > current.roundoff) {
+            return std::nullopt;
+        }
+        const double h = std::clamp(2.0e-5 * std::max(1.0, std::abs(root)), 1.0e-7, 1.0e-3);
+        const auto below = sample_equation(cfg, arena, left, right, root - h);
+        const auto above = sample_equation(cfg, arena, left, right, root + h);
+        if (!below || !above) return std::nullopt;
+        const double curvature = (above->derivative - below->derivative) / (2.0 * h);
+        if (!std::isfinite(curvature) || curvature == 0.0) return std::nullopt;
+        const double step = -current.derivative / curvature;
+        // Only search inside the unresolved neighbourhood of a possible
+        // tangency, not for a distant extremum of an ill-conditioned equation.
+        const double radius = 4.0 * std::sqrt(current.roundoff / std::abs(curvature));
+        if (!std::isfinite(step) || !std::isfinite(radius) || std::abs(step) > radius) return std::nullopt;
+        const double next = root + step;
+        if (!std::isfinite(next) || std::abs(next) > cfg.max_abs || next == root) return std::nullopt;
+        const auto sample = sample_equation(cfg, arena, left, right, next);
+        if (!sample) return std::nullopt;
+        root = next;
+        current = *sample;
+    }
+    return current.residual == 0.0 && current.roundoff == 0.0
+        ? std::optional<double>{root} : std::nullopt;
+}
+
 static std::optional<double> refine_equation_root(const Config& cfg,
                                                   const std::vector<Node>& arena,
                                                   ExprId left,
@@ -8054,29 +8438,21 @@ static std::optional<double> refine_equation_root(const Config& cfg,
                                                   double initial_root) {
     if (cfg.equation_quality == EquationQualityMode::Off) return initial_root;
 
-    const auto evaluate = [&](double x) -> std::optional<std::pair<double, double>> {
-        const auto left_value = evaluate_equation_node(cfg, arena, left, x);
-        const auto right_value = evaluate_equation_node(cfg, arena, right, x);
-        if (!left_value || !right_value) return std::nullopt;
-        const double residual = *left_value - *right_value;
-        if (!valid_numeric(residual, cfg)) return std::nullopt;
-        return std::pair{residual, std::max({1.0, std::abs(*left_value), std::abs(*right_value)})};
+    const auto evaluate = [&](double x) {
+        return sample_equation(cfg, arena, left, right, x);
     };
 
-    auto at_target = evaluate(cfg.target);
+    // Generation already evaluated every node and its derivative/error at T.
+    // Reuse that work instead of recursively traversing both trees per pair.
+    const Node& a = arena[left];
+    const Node& b = arena[right];
+    const auto at_target = make_equation_sample(cfg, {a.value, a.error, a.derivative},
+                                                    {b.value, b.error, b.derivative});
     if (!at_target) return std::nullopt;
-    // Convergence has to mean "the sides are the same double", not "the residual
-    // is small relative to them".  The old 1e-12 relative term accepted a
-    // residual a million times larger than the operands could resolve, which is
-    // what let a nonzero difference be reported as a root at the target.
-    const auto converged = [](double residual, double scale) {
-        return std::abs(residual) <=
-               kResidualNoiseUlps * std::numeric_limits<double>::epsilon() * scale;
-    };
-    if (converged(at_target->first, at_target->second)) return cfg.target;
+    if (equation_root_converged(*at_target, cfg.target)) return cfg.target;
 
     double previous_x = cfg.target;
-    double previous_residual = at_target->first;
+    double previous_residual = at_target->residual;
     double current_x = initial_root;
     auto current = evaluate(current_x);
     if (!current) {
@@ -8096,31 +8472,26 @@ static std::optional<double> refine_equation_root(const Config& cfg,
     // Newton converges linearly at a double root, so the iteration budget has to
     // cover the extra steps that the tightened tolerance now asks for.
     for (unsigned iteration = 0; iteration < 64; ++iteration) {
-        if (converged(current->first, current->second)) return current_x;
+        if (equation_root_converged(*current, current_x)) return current_x;
+        if (std::abs(current->residual) <= current->roundoff) {
+            const auto tangent = refine_exact_equation_tangency(cfg, arena, left, right, current_x, *current);
+            return tangent && std::abs(*tangent - cfg.target) <= travel_limit ? tangent : std::nullopt;
+        }
 
-        const double h = std::clamp(
-            2.0e-6 * std::max(1.0, std::abs(current_x)), 1.0e-8, 1.0e-3);
-        const auto below = evaluate(current_x - h);
-        const auto above = evaluate(current_x + h);
-        double derivative = std::numeric_limits<double>::quiet_NaN();
-        if (below && above) derivative = (above->first - below->first) / (2.0 * h);
-        if (!std::isfinite(derivative) ||
-            std::abs(derivative) <= 64.0 * std::numeric_limits<double>::epsilon()) {
-            const double denominator = current->first - previous_residual;
+        double derivative = current->derivative;
+        if (!std::isfinite(derivative) || derivative == 0.0) {
+            const double denominator = current->residual - previous_residual;
             if (current_x != previous_x && denominator != 0.0) {
                 derivative = denominator / (current_x - previous_x);
             }
         }
-        if (!std::isfinite(derivative) ||
-            std::abs(derivative) <= 64.0 * std::numeric_limits<double>::epsilon()) {
-            return std::nullopt;
-        }
+        if (!std::isfinite(derivative) || derivative == 0.0) return std::nullopt;
 
-        double step = -current->first / derivative;
+        double step = -current->residual / derivative;
         if (!std::isfinite(step)) return std::nullopt;
         step = std::clamp(step, -travel_limit, travel_limit);
 
-        std::optional<std::pair<double, double>> next;
+        std::optional<EquationSample> next;
         double next_x = current_x;
         double fraction = 1.0;
         for (unsigned attempt = 0; attempt < 18; ++attempt) {
@@ -8128,7 +8499,7 @@ static std::optional<double> refine_equation_root(const Config& cfg,
             if (std::isfinite(proposed) && std::abs(proposed) <= cfg.max_abs) {
                 auto evaluated = evaluate(proposed);
                 if (evaluated &&
-                    (std::abs(evaluated->first) < std::abs(current->first) || fraction <= 1.0 / 64.0)) {
+                    (std::abs(evaluated->residual) < std::abs(current->residual) || fraction <= 1.0 / 64.0)) {
                     next_x = proposed;
                     next = std::move(evaluated);
                     break;
@@ -8139,7 +8510,7 @@ static std::optional<double> refine_equation_root(const Config& cfg,
         if (!next || next_x == current_x) return std::nullopt;
 
         previous_x = current_x;
-        previous_residual = current->first;
+        previous_residual = current->residual;
         current_x = next_x;
         current = std::move(next);
 
@@ -8151,14 +8522,16 @@ static std::optional<double> refine_equation_root(const Config& cfg,
         if (std::abs(current_x - cfg.target) > travel_limit) return std::nullopt;
     }
 
-    return current && converged(current->first, current->second)
+    return current && equation_root_converged(*current, current_x)
         ? std::optional<double>{current_x}
         : std::nullopt;
 }
 
 static std::vector<EquationMatch> collect_equation_matches(const Config& cfg,
                                                            const std::vector<Node>& arena,
-                                                           std::size_t limit) {
+                                                           std::size_t limit,
+                                                           ParallelExecutor* executor) {
+    if (limit == 0) return {};
     std::vector<ExprId> ids;
     ids.reserve(arena.size());
     for (std::size_t i = 0; i < arena.size(); ++i) {
@@ -8170,68 +8543,106 @@ static std::vector<EquationMatch> collect_equation_matches(const Config& cfg,
         return arena[a].hash < arena[b].hash;
     });
 
-    std::vector<EquationMatch> all;
-    all.reserve(std::min<std::size_t>(ids.size() * 2, 1'000'000));
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        const Node& a = arena[ids[i]];
-        const std::size_t end = std::min(ids.size(), i + 1 + cfg.equation_neighbors);
-        for (std::size_t j = i + 1; j < end; ++j) {
-            const Node& b = arena[ids[j]];
-            if (!a.depends_on_x && !b.depends_on_x) continue;
-            const unsigned cost = static_cast<unsigned>(a.cost) + b.cost;
-            if (cost > cfg.max_cost || a.hash == b.hash) continue;
+    const EquationProbeCache probes(cfg, arena);
+    // Fixed partitions and a total ranking order keep the result independent
+    // of worker count. A global top N is contained in the union of local top Ns;
+    // records need only the best valid equation at each cost in each partition.
+    constexpr std::size_t kEquationTaskSize = 256;
+    const std::size_t task_count = (ids.size() + kEquationTaskSize - 1) / kEquationTaskSize;
+    std::vector<std::vector<EquationMatch>> partial(task_count);
+    const bool nearest = cfg.mode == "nearest";
+    const auto cost_position = [](auto& matches, unsigned cost) {
+        return std::lower_bound(matches.begin(), matches.end(), cost,
+            [](const EquationMatch& match, unsigned value) { return match.cost < value; });
+    };
+    const auto process = [&](std::size_t task) {
+        auto& matches = partial[task];
+        matches.reserve(std::min<std::size_t>(limit, 256));
+        const std::size_t begin = task * kEquationTaskSize;
+        const std::size_t task_end = std::min(ids.size(), begin + kEquationTaskSize);
+        for (std::size_t i = begin; i < task_end; ++i) {
+            const Node& a = arena[ids[i]];
+            const std::size_t end = std::min(ids.size(), i + 1 + cfg.equation_neighbors);
+            for (std::size_t j = i + 1; j < end; ++j) {
+                const Node& b = arena[ids[j]];
+                if (!a.depends_on_x && !b.depends_on_x) continue;
+                const unsigned cost = static_cast<unsigned>(a.cost) + b.cost;
+                if (cost > cfg.max_cost || a.hash == b.hash) continue;
 
-            const double slope = a.derivative - b.derivative;
-            const double slope_scale = std::max({1.0, std::abs(a.derivative), std::abs(b.derivative)});
-            if (!std::isfinite(slope) || std::abs(slope) <= 16.0 * std::numeric_limits<double>::epsilon() * slope_scale) {
-                continue;
-            }
-            const double residual = a.value - b.value;
-            const double initial_correction = -residual / slope;
-            const double initial_root = cfg.target + initial_correction;
-            if (!std::isfinite(initial_root) || std::abs(initial_root) > cfg.max_abs) {
-                continue;
-            }
+                const double slope = a.derivative - b.derivative;
+                const double slope_scale = std::max({1.0, std::abs(a.derivative), std::abs(b.derivative)});
+                if (!std::isfinite(slope) || std::abs(slope) <= 16.0 * std::numeric_limits<double>::epsilon() * slope_scale) {
+                    continue;
+                }
+                const double residual = a.value - b.value;
+                const double initial_correction = -residual / slope;
+                const double initial_root = cfg.target + initial_correction;
+                if (!std::isfinite(initial_root) || std::abs(initial_root) > cfg.max_abs) continue;
 
-            ExprId left = ids[i];
-            ExprId right = ids[j];
-            if (!equation_is_stable(cfg, arena, left, right, residual, slope, initial_root)) {
-                continue;
-            }
-            const auto refined_root = refine_equation_root(cfg, arena, left, right, initial_root);
-            if (!refined_root) continue;
-            const double root = *refined_root;
-            if (!equation_root_is_isolated(cfg, arena, left, right, root)) continue;
-            const double correction = root - cfg.target;
-            const double error = std::abs(correction);
-            if (!cfg.error_range.contains(correction)) continue;
+                ExprId left = ids[i];
+                ExprId right = ids[j];
+                if (!equation_is_stable(cfg, arena, left, right, residual, slope, initial_root, &probes)) continue;
+                const auto refined_root = refine_equation_root(cfg, arena, left, right, initial_root);
+                if (!refined_root) continue;
+                const double root = *refined_root;
+                const double correction = root - cfg.target;
+                if (!cfg.error_range.contains(correction)) continue;
 
-            double oriented_residual = residual;
-            if (!a.depends_on_x && b.depends_on_x) {
-                std::swap(left, right);
-                oriented_residual = -residual;
+                double oriented_residual = residual;
+                if (!a.depends_on_x && b.depends_on_x) {
+                    std::swap(left, right);
+                    oriented_residual = -residual;
+                }
+                const EquationMatch match{left, right, root, std::abs(correction), oriented_residual, cost,
+                                          static_cast<unsigned>(a.nodes) + b.nodes};
+                if (nearest) {
+                    if (matches.size() == limit && !equation_better(match, matches.front())) continue;
+                } else {
+                    const auto position = cost_position(matches, cost);
+                    if (position != matches.end() && position->cost == cost &&
+                        !equation_better(match, *position)) continue;
+                }
+                if (!equation_root_is_isolated(cfg, arena, left, right, root)) continue;
+                const auto constraint_state = constraint_join_equation(
+                    cfg, arena[left].constraint_state, arena[right].constraint_state,
+                    arena[left].value, arena[right].value, cost);
+                if (!constraint_state || !constraint_satisfied(cfg, *constraint_state)) continue;
+
+                if (nearest) {
+                    if (matches.size() == limit) {
+                        std::pop_heap(matches.begin(), matches.end(), equation_better);
+                        matches.back() = match;
+                    } else {
+                        matches.push_back(match);
+                    }
+                    std::push_heap(matches.begin(), matches.end(), equation_better);
+                } else {
+                    const auto position = cost_position(matches, cost);
+                    if (position != matches.end() && position->cost == cost) *position = match;
+                    else matches.insert(position, match);
+                }
             }
-            const auto constraint_state = constraint_join_equation(
-                cfg, arena[left].constraint_state, arena[right].constraint_state,
-                arena[left].value, arena[right].value, cost);
-            if (!constraint_state || !constraint_satisfied(cfg, *constraint_state)) continue;
-            all.push_back({left, right, root, error, oriented_residual, cost,
-                           static_cast<unsigned>(a.nodes) + b.nodes});
         }
+    };
+    if (executor) executor->run(task_count, process);
+    else for (std::size_t task = 0; task < task_count; ++task) process(task);
+
+    std::size_t count = 0;
+    for (const auto& matches : partial) count += matches.size();
+    std::vector<EquationMatch> all;
+    all.reserve(count);
+    for (const auto& matches : partial) all.insert(all.end(), matches.begin(), matches.end());
+    if (nearest) {
+        std::sort(all.begin(), all.end(), equation_better);
+        if (all.size() > limit) all.resize(limit);
+        return all;
     }
 
     std::sort(all.begin(), all.end(), [](const EquationMatch& a, const EquationMatch& b) {
         if (a.cost != b.cost) return a.cost < b.cost;
         return equation_better(a, b);
     });
-
     std::vector<EquationMatch> matches;
-    if (cfg.mode == "nearest") {
-        std::sort(all.begin(), all.end(), equation_better);
-        if (all.size() > limit) all.resize(limit);
-        return all;
-    }
-
     double best = std::numeric_limits<double>::infinity();
     std::size_t begin = 0;
     while (begin < all.size()) {
@@ -8463,11 +8874,13 @@ static void print_stats(const SearchRun& run) {
               << ",egraph:" << run.stats.egraph_seconds << ",pslq:" << run.stats.pslq_seconds
               << ",mcts:" << run.stats.mcts_seconds
               << ",genetic:" << run.stats.genetic_seconds;
+    if (run.cfg.equations) std::cerr << ",equations:" << run.stats.equation_seconds;
     std::cerr << " time=" << std::fixed << std::setprecision(3) << run.stats.seconds << "s\n";
 }
 
 static void print_equation_results(const SearchRun& run) {
-    auto matches = collect_equation_matches(run.cfg, run.arena, run.cfg.results);
+    auto matches = run.equation_matches ? *run.equation_matches
+        : collect_equation_matches(run.cfg, run.arena, run.cfg.results);
     deduplicate_equation_matches(run, matches);
     if (run.cfg.json) {
         std::cout << "{\n  \"target\": " << std::setprecision(17) << run.cfg.target
@@ -8520,6 +8933,7 @@ static void print_equation_results(const SearchRun& run) {
                   << ", \"pslq\": " << run.stats.pslq_seconds
                   << ", \"mcts\": " << run.stats.mcts_seconds
                   << ", \"genetic\": " << run.stats.genetic_seconds
+                  << ", \"equations\": " << run.stats.equation_seconds
                   << "}, \"seconds\": " << run.stats.seconds << "}\n}\n";
         return;
     }
@@ -9617,6 +10031,365 @@ static int run_self_test() {
     };
 
     {
+        bool equivalent = true;
+        for (const bool derivative_sensitive : {false, true}) {
+            for (const unsigned slots : {2U, 3U, 5U}) {
+                for (const std::size_t extra_cap : {1U, 3U, 37U}) {
+                    const double target = 7.5;
+                    const unsigned bits = slots == 2 ? 48 : 12;
+                    CandidateCollector collector(target, bits, 256, derivative_sensitive,
+                                                 0, slots, extra_cap);
+                    FastMap<std::uint64_t, Candidate> reference;
+                    reference.reserve(extra_cap * 2 + 1);
+                    const auto key_of = [&](const Candidate& candidate) {
+                        const auto state = state_bucket(candidate.value, candidate.derivative,
+                                                        candidate.depends_on_x, candidate.constraint_state,
+                                                        bits, derivative_sensitive);
+                        const auto slot = candidate_shape_signature(candidate) % (slots - 1U);
+                        return mix64(state ^ (0x9e3779b97f4a7c15ULL * (slot + 1U)));
+                    };
+                    const auto elegant = [&](const Candidate& a, const Candidate& b) {
+                        if (a.nodes != b.nodes) return a.nodes < b.nodes;
+                        if (a.depth != b.depth) return a.depth < b.depth;
+                        const double ea = abs_error(a.value, target);
+                        const double eb = abs_error(b.value, target);
+                        if (ea != eb) return ea < eb;
+                        return a.hash < b.hash;
+                    };
+                    const auto insert_reference = [&](const Candidate& candidate) {
+                        const auto [it, inserted] = reference.try_emplace(key_of(candidate), candidate);
+                        if (!inserted && elegant(candidate, it->second)) it->second = candidate;
+                    };
+                    // Literal pre-optimization selection, including partial
+                    // ordering ties, insertion order and repeated pruning.
+                    const auto prune_reference = [&](std::size_t cap) {
+                        if (reference.size() <= cap) return;
+                        std::vector<Candidate> all;
+                        for (const auto& [_, candidate] : reference) all.push_back(candidate);
+                        const double floor = std::ldexp(std::max(1.0, std::abs(target)),
+                                                        -static_cast<int>(bits));
+                        const auto order = [&](const Candidate& a, const Candidate& b) {
+                            const bool near_a = abs_error(a.value, target) <= floor;
+                            const bool near_b = abs_error(b.value, target) <= floor;
+                            if (near_a != near_b) return near_a;
+                            return elegant(a, b);
+                        };
+                        const std::size_t near_count = std::min(cap, std::max<std::size_t>(1, cap / 2));
+                        std::nth_element(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(near_count),
+                                         all.end(), order);
+                        std::vector<Candidate> keep(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(near_count));
+                        pdqsort(all.begin() + static_cast<std::ptrdiff_t>(near_count), all.end(),
+                                [](const Candidate& a, const Candidate& b) {
+                                    if (a.value != b.value) return a.value < b.value;
+                                    return a.hash < b.hash;
+                                });
+                        const std::size_t rest = all.size() - near_count;
+                        const std::size_t spread = std::min(cap - keep.size(), rest);
+                        for (std::size_t i = 0; i < spread; ++i) {
+                            const std::size_t position = spread == 1
+                                ? rest / 2 : (i * (rest - 1)) / (spread - 1);
+                            keep.push_back(all[near_count + position]);
+                        }
+                        reference.clear();
+                        reference.reserve(cap * 2 + 1);
+                        for (const Candidate& candidate : keep) insert_reference(candidate);
+                    };
+                    for (std::uint64_t i = 0; i < 2048; ++i) {
+                        Candidate candidate;
+                        candidate.value = i % 11 == 0
+                            ? target + std::ldexp(static_cast<double>(static_cast<int>(i % 3) - 1), -48)
+                            : static_cast<double>(i % 307) / 8.0 - 12.0;
+                        candidate.derivative = static_cast<double>(i % 7);
+                        candidate.depends_on_x = i % 3 != 0;
+                        candidate.constraint_state = i % 5;
+                        candidate.hash = mix64(i % 127);
+                        candidate.nodes = static_cast<std::uint16_t>(i % 5);
+                        candidate.depth = static_cast<std::uint16_t>((i / 5) % 5);
+                        candidate.left = static_cast<ExprId>(i);
+                        candidate.tag = NodeTag::Binary;
+                        candidate.op = static_cast<std::uint8_t>(i % 5);
+                        collector.consider_extra_only(candidate);
+                        insert_reference(candidate);
+                        if (reference.size() > extra_cap * 2) prune_reference(extra_cap);
+                    }
+                    const std::size_t cap = std::max<std::size_t>(1, extra_cap / 2);
+                    auto actual = collector.take_extras(cap);
+                    prune_reference(cap);
+                    std::vector<Candidate> expected;
+                    for (const auto& [_, candidate] : reference) expected.push_back(candidate);
+                    pdqsort(expected.begin(), expected.end(), [](const Candidate& a, const Candidate& b) {
+                        if (a.value != b.value) return a.value < b.value;
+                        if (a.nodes != b.nodes) return a.nodes < b.nodes;
+                        if (a.depth != b.depth) return a.depth < b.depth;
+                        return a.hash < b.hash;
+                    });
+                    equivalent &= actual == expected;
+                }
+            }
+        }
+        check(equivalent, "紧凑结构排序与原裁剪完全一致（槽数、近似相等、同序键和约束）");
+    }
+    {
+        unsigned renders = 0;
+        const auto text_renderer = [](const Candidate& candidate) { return std::to_string(candidate.hash); };
+        const auto latex_renderer = [&](const Candidate& candidate) {
+            ++renders;
+            return std::to_string(candidate.hash) + ":" + std::to_string(candidate.left);
+        };
+        LiveTopReporter reporter(0.0, 48, parse_error_range("(0,inf)"), 2, 1.0e9,
+                                 text_renderer, latex_renderer, true, false,
+                                 [](const Candidate& candidate) { return candidate.hash != 999; });
+        Candidate first;
+        first.value = 1;
+        first.hash = 11;
+        first.cost = 1;
+        first.nodes = 5;
+        first.left = 1;
+        Candidate second = first;
+        second.value = 2;
+        second.hash = 22;
+        reporter.consider_batch({first, second}, 1);
+        const unsigned initial = renders;
+        Candidate rejected = first;
+        rejected.value = -1;
+        reporter.consider_batch({rejected}, 1);
+        rejected.value = 0.1;
+        rejected.hash = 999;
+        reporter.consider_batch({rejected}, 1);
+        Candidate worse = second;
+        worse.value = 3;
+        worse.hash = 33;
+        reporter.consider_batch({worse}, 1);
+        const bool skipped = initial == 2 && renders == initial;
+        // Same hash/value/cost is not enough to prove identical candidates.
+        first.nodes = 3;
+        first.left = 44;
+        reporter.consider_batch({first}, 1);
+        const bool refreshed = renders > initial;
+        Candidate better = first;
+        better.value = 0.5;
+        better.hash = 44;
+        reporter.consider_batch({better}, 1);
+        std::ostringstream output;
+        auto* previous = std::cerr.rdbuf(output.rdbuf());
+        reporter.snapshot(2);
+        std::cerr.rdbuf(previous);
+        check(skipped && refreshed && output.str().find("\"value\":0.5") != std::string::npos &&
+                  output.str().find("\"latex\":\"11:44\"") != std::string::npos,
+              "实时榜单跳过无变化渲染，保留真实改进和完整候选更新");
+    }
+    {
+        bool complete = true;
+        bool exceptions_safe = true;
+        for (const unsigned threads : {1U, 4U, 16U}) {
+            ParallelExecutor executor(threads);
+            // Short batches can finish before sleeping workers even wake up.
+            // Mix those with longer batches and inline calls so late workers
+            // must skip closed generations without touching expired captures.
+            static constexpr std::size_t counts[] = {0, 1, 2, 3, 7, 31, 32, 33, 127};
+            for (unsigned round = 0; round < 180; ++round) {
+                const std::size_t count = counts[round % std::size(counts)];
+                std::vector<std::atomic<unsigned>> visits(count);
+                std::vector<unsigned> generations(count);
+                executor.run(count, [&](std::size_t i) {
+                    if ((i + round) % 17 == 0) std::this_thread::yield();
+                    ++visits[i];
+                    generations[i] = round + 1;
+                });
+                for (std::size_t i = 0; i < count; ++i) {
+                    complete &= visits[i].load() == 1 && generations[i] == round + 1;
+                }
+            }
+            for (const std::size_t fail_at : {0U, 7U, 31U}) {
+                std::atomic<unsigned> active{0};
+                struct ActiveTask {
+                    std::atomic<unsigned>& count;
+                    explicit ActiveTask(std::atomic<unsigned>& n) : count(n) { ++count; }
+                    ~ActiveTask() { --count; }
+                };
+                bool caught = false;
+                try {
+                    executor.run(64, [&](std::size_t i) {
+                        ActiveTask guard(active);
+                        if (i == fail_at) throw std::runtime_error("executor test");
+                        std::this_thread::yield();
+                    });
+                } catch (const std::runtime_error&) {
+                    caught = true;
+                }
+                exceptions_safe &= caught && active.load() == 0;
+                std::atomic<unsigned> sum{0};
+                executor.run(17, [&](std::size_t i) { sum += static_cast<unsigned>(i + 1); });
+                exceptions_safe &= sum.load() == 153;
+            }
+        }
+        check(complete, "线程池连续分派、迟到唤醒和空任务不丢失或重复工作");
+        check(exceptions_safe, "线程池异常等待在途任务退出，随后仍可复用");
+    }
+    {
+        bool equivalent = true;
+        for (const bool derivative_sensitive : {false, true}) {
+            for (const std::size_t cap : {1U, 17U, 192U}) {
+                CandidateCollector source(7.5, 48, 2048, derivative_sensitive, 0, 3, 64);
+                CandidateCollector reference(7.5, 48, 2048, derivative_sensitive, 0, 3, 64);
+                for (std::uint64_t i = 0; i < 1536; ++i) {
+                    Candidate candidate;
+                    candidate.value = static_cast<double>(mix64(i) % 701) / 8.0 - 40.0;
+                    candidate.derivative = static_cast<double>(i % 7);
+                    candidate.depends_on_x = (i % 3) != 0;
+                    candidate.constraint_state = i % 5;
+                    candidate.hash = mix64(i + 17);
+                    candidate.nodes = static_cast<std::uint16_t>(1 + i % 13);
+                    candidate.depth = static_cast<std::uint16_t>(1 + i % 5);
+                    candidate.left = static_cast<ExprId>(i);
+                    source.consider(candidate);
+                    reference.consider(candidate);
+                }
+                auto expected = reference.take(cap);
+                const auto key_of = [&](const Candidate& candidate) {
+                    return state_bucket(candidate.value, candidate.derivative, candidate.depends_on_x,
+                                        candidate.constraint_state, 48, derivative_sensitive);
+                };
+                std::sort(expected.begin(), expected.end(), [&](const Candidate& a, const Candidate& b) {
+                    return mix64(key_of(a)) < mix64(key_of(b));
+                });
+                std::vector<Candidate> candidates;
+                std::vector<std::uint64_t> keys;
+                std::array<std::uint32_t, kMergeShards + 1> offsets{};
+                source.take_sharded(cap, candidates, keys, offsets);
+                equivalent &= candidates.size() == expected.size() && keys.size() == expected.size();
+                for (std::size_t i = 0; i < expected.size() && i < candidates.size(); ++i) {
+                    const Candidate& a = candidates[i];
+                    const Candidate& b = expected[i];
+                    equivalent &= keys[i] == key_of(b) && a.hash == b.hash && a.left == b.left &&
+                                  a.value == b.value && a.derivative == b.derivative &&
+                                  a.constraint_state == b.constraint_state && a.nodes == b.nodes &&
+                                  a.depth == b.depth && a.depends_on_x == b.depends_on_x;
+                    const std::size_t shard = merge_shard_of(keys[i]);
+                    equivalent &= offsets[shard] <= i && i < offsets[shard + 1];
+                }
+                equivalent &= offsets.back() == candidates.size();
+                const auto extras = source.take_extras(64);
+                const auto expected_extras = reference.take_extras(64);
+                equivalent &= extras.size() == expected_extras.size();
+                for (std::size_t i = 0; i < extras.size() && i < expected_extras.size(); ++i) {
+                    equivalent &= extras[i].hash == expected_extras[i].hash;
+                }
+                // Reusing the collector must rebuild its sorting slots after
+                // insertion and pruning change the table's contents.
+                Candidate additional;
+                additional.value = 7.50001;
+                additional.hash = 999999;
+                source.consider(additional);
+                source.take_sharded(cap, candidates, keys, offsets);
+                for (std::size_t i = 0; i < candidates.size(); ++i) {
+                    equivalent &= keys[i] == key_of(candidates[i]);
+                }
+            }
+        }
+        check(equivalent, "分片排序保持完整候选、状态键、结构候选和分片边界");
+    }
+    {
+        bool stable = true;
+        for (const bool derivative_sensitive : {false, true}) {
+            TaskResult task;
+            for (std::uint64_t i = 0; i < 2048; ++i) {
+                Candidate candidate;
+                candidate.value = static_cast<double>(mix64(i) % 127) - 63.0;
+                candidate.derivative = static_cast<double>(i % 11);
+                candidate.depends_on_x = (i % 3) != 0;
+                candidate.constraint_state = i % 5;
+                candidate.hash = i;
+                task.extra_candidates.push_back(candidate);
+            }
+            const auto original = task.extra_candidates;
+            task.shard_extras(48, derivative_sensitive);
+            stable &= task.extra_keys.size() == original.size() &&
+                      task.extra_shard_offsets.back() == original.size();
+            for (std::size_t shard = 0; shard < kMergeShards; ++shard) {
+                std::size_t index = task.extra_shard_offsets[shard];
+                for (const Candidate& candidate : original) {
+                    const auto key = state_bucket(candidate.value, candidate.derivative,
+                                                  candidate.depends_on_x, candidate.constraint_state,
+                                                  48, derivative_sensitive);
+                    if (merge_shard_of(key) != shard) continue;
+                    stable &= index < task.extra_shard_offsets[shard + 1] &&
+                              task.extra_candidates[index].hash == candidate.hash &&
+                              task.extra_keys[index] == key;
+                    ++index;
+                }
+                stable &= index == task.extra_shard_offsets[shard + 1];
+            }
+            task.extra_candidates.clear();
+            task.shard_extras(48, derivative_sensitive);
+            stable &= task.extra_keys.empty() && task.extra_shard_offsets.back() == 0;
+        }
+        check(stable, "结构候选按状态键稳定分片，保留每个分片的原始顺序");
+    }
+    {
+        std::vector<TaskResult> tasks(6);
+        std::vector<std::vector<Candidate>> original_extras(tasks.size());
+        for (std::size_t t = 0; t < tasks.size(); ++t) {
+            CandidateCollector source(7.5, 48, 2048, false, 0, 3, 1024);
+            for (std::uint64_t i = 0; i < 6000; ++i) {
+                const auto hash = mix64(i + 6000 * t);
+                Candidate candidate;
+                candidate.value = static_cast<double>(hash % 4096) / 8.0;
+                candidate.hash = hash;
+                candidate.nodes = static_cast<std::uint16_t>(1 + (hash >> 16U) % 12);
+                candidate.depth = static_cast<std::uint16_t>(1 + (hash >> 32U) % 6);
+                candidate.tag = NodeTag::Binary;
+                candidate.op = static_cast<std::uint8_t>(hash % 5);
+                source.consider(candidate);
+            }
+            TaskResult& task = tasks[t];
+            source.take_sharded(2048, task.candidates, task.keys, task.shard_offsets);
+            task.extra_candidates = source.take_extras(1024);
+            original_extras[t] = task.extra_candidates;
+            task.shard_extras(48, false);
+        }
+        const auto signature = [](ShardedArchive& archive) {
+            auto candidates = archive.take(128);
+            const auto extras = archive.take_extras(128);
+            candidates.insert(candidates.end(), extras.begin(), extras.end());
+            std::vector<std::uint64_t> hashes;
+            for (const Candidate& candidate : candidates) hashes.push_back(candidate.hash);
+            return hashes;
+        };
+        bool equivalent = true;
+        for (const bool indexed : {false, true}) {
+            const std::vector<std::uint32_t> indices = indexed
+                ? std::vector<std::uint32_t>{5, 1, 3}
+                : std::vector<std::uint32_t>{0, 1, 2, 3, 4, 5};
+            ShardedArchive reference(7.5, 48, 128, false, 3, 128);
+            for (const auto index : indices) {
+                const TaskResult& task = tasks[index];
+                for (std::size_t i = 0; i < task.candidates.size(); ++i) {
+                    reference.consider_with_key(task.candidates[i], task.keys[i]);
+                }
+            }
+            for (const auto index : indices) {
+                for (const Candidate& candidate : original_extras[index]) reference.consider_extra_only(candidate);
+            }
+            const auto expected = signature(reference);
+            for (const unsigned threads : {1U, 4U}) {
+                ParallelExecutor executor(threads);
+                ShardedArchive archive(7.5, 48, 128, false, 3, 128);
+                if (indexed) {
+                    executor.run(kMergeShards, [&](std::size_t shard) {
+                        archive.absorb_shard(tasks, indices, shard);
+                    });
+                } else {
+                    archive.absorb(tasks, executor);
+                }
+                archive.prepare(executor);
+                equivalent &= signature(archive) == expected;
+            }
+        }
+        check(equivalent, "并行结构候选合并与原串行顺序完全一致（含裁剪和索引任务）");
+    }
+
+    {
         Config cfg;
         cfg.max_cost = 2;
         cfg.constants = "none";
@@ -10240,6 +11013,255 @@ static int run_self_test() {
               "有效位判据区分真实小量与噪声");
     }
     {
+        // Reproduce both impossible equations from the 77777 web/CLI report
+        // using the actual search operators, derivatives and error estimates.
+        Config cfg;
+        cfg.equations = true;
+        cfg.max_cost = 16;
+        std::vector<Node> arena;
+        const auto atom = [&](double value, bool variable = false) {
+            Node node;
+            node.value = value;
+            node.derivative = variable ? 1.0 : 0.0;
+            node.error = variable ? 0.0 : atom_rounding_error(value);
+            node.hash = mix64(std::bit_cast<std::uint64_t>(value));
+            node.cost = node.nodes = node.depth = 1;
+            node.depends_on_x = variable;
+            node.eligible = false;
+            arena.push_back(node);
+            return static_cast<ExprId>(arena.size() - 1);
+        };
+        const auto append = [&](const std::optional<Candidate>& candidate) {
+            if (!candidate) throw std::runtime_error("方程回归样例被构造器拒绝");
+            const Candidate& c = *candidate;
+            Node node;
+            node.value = c.value; node.derivative = c.derivative; node.error = c.error;
+            node.hash = c.hash; node.cost = c.cost; node.nodes = c.nodes; node.depth = c.depth;
+            node.tag = c.tag; node.op = c.op; node.left = c.left; node.right = c.right;
+            node.depends_on_x = c.depends_on_x; node.eligible = false;
+            arena.push_back(node);
+            return static_cast<ExprId>(arena.size() - 1);
+        };
+        const auto unary = [&](UnaryKind kind, ExprId child) {
+            const auto cost = static_cast<std::uint16_t>(default_unary_cost(kind));
+            return append(apply_unary(cfg, arena, {kind, cost}, child,
+                                     static_cast<std::uint16_t>(arena[child].cost + cost)));
+        };
+        const auto binary = [&](BinaryKind kind, ExprId left, ExprId right) {
+            const auto cost = static_cast<std::uint16_t>(default_binary_cost(kind));
+            return append(apply_binary(cfg, arena, {kind, cost}, left, right,
+                static_cast<std::uint16_t>(arena[left].cost + arena[right].cost + cost)));
+        };
+        const auto make = [&](double target, unsigned variant) {
+            cfg.target = target;
+            arena.clear();
+            const ExprId x = atom(target, true);
+            const ExprId gamma = atom(0.57721566490153286061);
+            const ExprId inverse_x = unary(UnaryKind::Inv, x);
+            const ExprId right = unary(UnaryKind::Inv,
+                binary(BinaryKind::Sub, binary(BinaryKind::Add, gamma, inverse_x), gamma));
+            ExprId term;
+            if (variant == 0) {
+                const ExprId phi = atom((1.0 + std::sqrt(5.0)) / 2.0);
+                term = binary(BinaryKind::Div, gamma, binary(BinaryKind::Pow, x, phi));
+            } else if (variant == 1) {
+                const ExprId e = atom(std::numbers::e_v<double>);
+                term = binary(BinaryKind::Pow, inverse_x, unary(UnaryKind::Sqrt, e));
+            } else {
+                term = unary(UnaryKind::Sin, x);
+            }
+            const ExprId left = binary(BinaryKind::Add, x, term);
+            arena[left].eligible = arena[right].eligible = true;
+            return std::pair{left, right};
+        };
+        bool rejected = true;
+        bool legacy_kept = true;
+        for (unsigned variant = 0; variant < 2; ++variant) {
+            const auto [left, right] = make(77777.0, variant);
+            const auto sample = sample_equation(cfg, arena, left, right, cfg.target);
+            rejected &= sample && sample->noise_floor > 100.0 * sample->operand_noise_floor;
+            for (const auto quality : {EquationQualityMode::Strict, EquationQualityMode::Local}) {
+                cfg.equation_quality = quality;
+                rejected &= !equation_root_is_isolated(cfg, arena, left, right, cfg.target);
+                rejected &= collect_equation_matches(cfg, arena, 20).empty();
+            }
+            cfg.equation_quality = EquationQualityMode::Off;
+            legacy_kept &= !collect_equation_matches(cfg, arena, 20).empty();
+        }
+        check(rejected && legacy_kept, "累计抵消误差不再伪装为孤立方程根（两种77777样例）");
+        const auto [left, right] = make(std::numbers::pi_v<double>, 2);
+        cfg.equation_quality = EquationQualityMode::Strict;
+        check(equation_root_is_isolated(cfg, arena, left, right, cfg.target) &&
+                  !collect_equation_matches(cfg, arena, 20).empty(),
+              "带抵消子表达式但有可靠局部信号的真实根仍保留");
+    }
+    {
+        Config cfg;
+        cfg.target = 777777.0;
+        cfg.equations = true;
+        cfg.max_cost = 32;
+        std::vector<Node> arena;
+        const auto atom = [&](double value, bool variable = false) {
+            Node node;
+            node.value = value;
+            node.derivative = variable ? 1.0 : 0.0;
+            node.error = variable ? 0.0 : atom_rounding_error(value);
+            node.hash = mix64(std::bit_cast<std::uint64_t>(value));
+            node.cost = node.nodes = node.depth = 1;
+            node.depends_on_x = variable;
+            node.eligible = false;
+            arena.push_back(node);
+            return static_cast<ExprId>(arena.size() - 1);
+        };
+        const auto append = [&](const std::optional<Candidate>& candidate) {
+            if (!candidate) throw std::runtime_error("根精度回归样例被构造器拒绝");
+            const Candidate& c = *candidate;
+            Node node;
+            node.value = c.value; node.derivative = c.derivative; node.error = c.error;
+            node.hash = c.hash; node.cost = c.cost; node.nodes = c.nodes; node.depth = c.depth;
+            node.tag = c.tag; node.op = c.op; node.left = c.left; node.right = c.right;
+            node.depends_on_x = c.depends_on_x; node.eligible = false;
+            arena.push_back(node);
+            return static_cast<ExprId>(arena.size() - 1);
+        };
+        const auto unary = [&](UnaryKind kind, ExprId child) {
+            const auto cost = static_cast<std::uint16_t>(default_unary_cost(kind));
+            return append(apply_unary(cfg, arena, {kind, cost}, child,
+                                     static_cast<std::uint16_t>(arena[child].cost + cost)));
+        };
+        const auto binary = [&](BinaryKind kind, ExprId left, ExprId right) {
+            const auto cost = static_cast<std::uint16_t>(default_binary_cost(kind));
+            return append(apply_binary(cfg, arena, {kind, cost}, left, right,
+                static_cast<std::uint16_t>(arena[left].cost + arena[right].cost + cost)));
+        };
+        const auto initial = [&](ExprId left, ExprId right) {
+            return cfg.target - (arena[left].value - arena[right].value) /
+                                (arena[left].derivative - arena[right].derivative);
+        };
+        const auto x = atom(cfg.target, true);
+        const auto pi = atom(std::numbers::pi_v<double>);
+        const auto reduced_left = unary(UnaryKind::Inv, binary(BinaryKind::Mul, x, pi));
+        const auto reduced_right = binary(BinaryKind::Div, unary(UnaryKind::Sin, x), x);
+        const auto left = binary(BinaryKind::Sub, reduced_left, x);
+        const auto right = binary(BinaryKind::Sub, reduced_right, x);
+        arena[left].eligible = arena[right].eligible = true;
+        // Independent analytic reduction: sin(x)=1/pi, nearest root below T.
+        constexpr double expected_root = 777776.98356594640319987045392487027583;
+        bool rejected = true;
+        bool reduced_kept = true;
+        for (const auto quality : {EquationQualityMode::Strict, EquationQualityMode::Local}) {
+            cfg.equation_quality = quality;
+            rejected &= !equation_root_is_isolated(cfg, arena, left, right, cfg.target);
+            const auto root = refine_equation_root(cfg, arena, left, right, initial(left, right));
+            rejected &= !root && collect_equation_matches(cfg, arena, 20).empty();
+            const auto reduced_root = refine_equation_root(cfg, arena, reduced_left, reduced_right,
+                                                           initial(reduced_left, reduced_right));
+            reduced_kept &= reduced_root && std::abs(*reduced_root - expected_root) < 1.0e-9 &&
+                equation_root_is_isolated(cfg, arena, reduced_left, reduced_right, *reduced_root);
+        }
+        check(rejected && reduced_kept, "777777共同大项不能掩盖根偏移，条件良好的等价式仍求得真根");
+        cfg.equation_quality = EquationQualityMode::Off;
+        check(refine_equation_root(cfg, arena, left, right, initial(left, right)) == initial(left, right) &&
+                  equation_root_is_isolated(cfg, arena, left, right, cfg.target),
+              "根精度修复保留off兼容模式");
+        cfg.equation_quality = EquationQualityMode::Strict;
+        bool scale_independent = true;
+        for (const double scale : {1.0e-12, 1.0, 1.0e12}) {
+            const auto factor = atom(scale);
+            const auto a = scale == 1.0 ? reduced_left : binary(BinaryKind::Mul, reduced_left, factor);
+            const auto b = scale == 1.0 ? reduced_right : binary(BinaryKind::Mul, reduced_right, factor);
+            const auto root = refine_equation_root(cfg, arena, a, b, initial(a, b));
+            scale_independent &= root && std::abs(*root - expected_root) < 1.0e-9 &&
+                equation_root_is_isolated(cfg, arena, a, b, *root);
+        }
+        check(scale_independent, "根精度按x衡量，不随方程两侧整体缩放而改变");
+
+        // A positive minimum hidden under a common 1 must not be rescued as a
+        // tangency just because double evaluation happens to return zero.
+        cfg.target = 1.0;
+        arena.clear();
+        const auto variable = atom(cfg.target, true);
+        const auto one = atom(1.0);
+        const auto offset = binary(BinaryKind::Sub, variable, one);
+        const auto minimum = binary(BinaryKind::Add, one, binary(BinaryKind::Mul, offset, offset));
+        const auto positive = binary(BinaryKind::Add, minimum, atom(1.0e-18));
+        check(!refine_equation_root(cfg, arena, positive, one, cfg.target) &&
+                  !equation_root_is_isolated(cfg, arena, positive, one, cfg.target),
+              "被舍入掩盖的正极小值不会当作切触根");
+    }
+    {
+        Config cfg;
+        cfg.target = 0.5;
+        cfg.equations = true;
+        cfg.digits = "0123";
+        cfg.constants = "e,phi,gamma";
+        cfg.ops = "+,-,*,/,^,neg,inv,sqrt,ln,exp,sin,cos,tan,sinh,cosh,tanh,asinh,acosh,atanh,gamma,abs";
+        cfg.max_cost = 8;
+        cfg.beam = 96;
+        cfg.pair_budget = 2'000;
+        cfg.show_stats = false;
+        const auto run = SearchEngine(cfg).run();
+        const EquationProbeCache probes(run.cfg, run.arena);
+        const double h = std::clamp(1.0e-5 * std::max(1.0, std::abs(cfg.target)), 1.0e-7, 5.0e-2);
+        const std::array<double, 4> points{cfg.target - h, cfg.target + h, cfg.target - 1.0, cfg.target + 1.0};
+        bool equivalent = !run.arena.empty();
+        bool derivatives_match = true;
+        for (ExprId id = 0; id < run.arena.size(); ++id) {
+            const auto at_target = evaluate_equation_with_error(run.cfg, run.arena, id, cfg.target);
+            if (!at_target) derivatives_match = false;
+            else {
+                const double expected = run.arena[id].derivative;
+                const double actual = at_target->derivative;
+                if (std::isfinite(expected) && std::isfinite(actual)) {
+                    derivatives_match &= std::abs(actual - expected) <=
+                        1.0e-12 * std::max({1.0, std::abs(actual), std::abs(expected)});
+                } else derivatives_match &= std::isfinite(expected) == std::isfinite(actual);
+            }
+            for (std::size_t point = 0; point < points.size(); ++point) {
+                const auto cached = probes.residual(id, 0, point);
+                const auto recursive = evaluate_equation_residual(run.cfg, run.arena, id, 0, points[point]);
+                equivalent &= cached == recursive;
+                const auto value = evaluate_equation_node(run.cfg, run.arena, id, points[point]);
+                const auto with_error = evaluate_equation_with_error(run.cfg, run.arena, id, points[point]);
+                if (with_error) equivalent &= value && with_error->value == *value;
+            }
+        }
+        check(equivalent, "方程固定探针缓存与递归求值一致（含定义域无效值和高级算子）");
+        check(derivatives_match, "求根解析导数与生成阶段一致（含高级算子）");
+    }
+    {
+        Config cfg;
+        cfg.target = 2.75;
+        cfg.equations = true;
+        cfg.digits = "123";
+        cfg.constants = "e,phi";
+        cfg.ops = "+,-,*,/,sqrt,ln";
+        cfg.max_cost = 12;
+        cfg.beam = 128;
+        cfg.pair_budget = 5'000;
+        cfg.results = 17;
+        cfg.show_stats = false;
+        auto run = SearchEngine(cfg).run();
+        ParallelExecutor executor(4);
+        bool equivalent = run.arena.size() > 256 && run.equation_matches &&
+            *run.equation_matches == collect_equation_matches(run.cfg, run.arena, cfg.results);
+        for (const std::string mode : {"nearest", "pareto"}) {
+            run.cfg.mode = mode;
+            for (const auto quality : {EquationQualityMode::Strict, EquationQualityMode::Local, EquationQualityMode::Off}) {
+                run.cfg.equation_quality = quality;
+                const auto full = collect_equation_matches(run.cfg, run.arena,
+                    run.arena.size() * run.cfg.equation_neighbors);
+                for (const std::size_t limit : {0U, 1U, 7U, 25U}) {
+                    auto expected = full;
+                    if (expected.size() > limit) expected.resize(limit);
+                    equivalent &= expected == collect_equation_matches(run.cfg, run.arena, limit);
+                    equivalent &= expected == collect_equation_matches(run.cfg, run.arena, limit, &executor);
+                }
+            }
+        }
+        check(equivalent, "方程分批有界排名与完整排名一致且跨线程确定");
+    }
+    {
         // exp(sqrt(x)) - inv(x) is bit-identical to exp(sqrt(x)) for a large x, so
         // the residual is flatly zero over an interval and the equality carries no
         // information.  The same absorption at a coarser scale used to report
@@ -10273,8 +11295,8 @@ static int run_self_test() {
               "数值吸收造成的伪根被拒绝且保留兼容开关");
     }
     {
-        // A tangential root is still a root: x = x*x has one at one, where the
-        // residual is x - x*x and never changes sign on the way in.
+        // A tangential root is still a root: x = x^x touches at one, and its
+        // residual is negative on both sides of the root.
         Config cfg;
         cfg.target = 1.0;
         cfg.equations = true;
@@ -10283,11 +11305,12 @@ static int run_self_test() {
         arena[0].derivative = 1.0;
         arena[0].tag = NodeTag::Atom;
         arena[0].depends_on_x = true;
-        arena[1].value = cfg.target * cfg.target;
-        arena[1].derivative = 2.0 * cfg.target;
-        arena[1].tag = NodeTag::Unary;
-        arena[1].op = static_cast<std::uint8_t>(UnaryKind::Sqr);
+        arena[1].value = std::pow(cfg.target, cfg.target);
+        arena[1].derivative = arena[1].value * (std::log(cfg.target) + 1.0);
+        arena[1].tag = NodeTag::Binary;
+        arena[1].op = static_cast<std::uint8_t>(BinaryKind::Pow);
         arena[1].left = 0;
+        arena[1].right = 0;
         arena[1].depends_on_x = true;
         check(equation_root_is_isolated(cfg, arena, 0, 1, cfg.target),
               "孤立零点即使不变号也判为方程根");
@@ -10312,8 +11335,9 @@ static int run_self_test() {
         const double slope = arena[0].derivative - arena[1].derivative;
         const double one_step = cfg.target - residual / slope;
         const auto root = refine_equation_root(cfg, arena, 0, 1, one_step);
-        check(root && std::abs(*root - 1.0) < 1.0e-5 && std::abs(one_step - 1.0) > 0.1,
-              "方程结果迭代到实际根而非一次 Newton 估计");
+        check(root && *root == 1.0 && std::abs(one_step - 1.0) > 0.1 &&
+                  equation_root_is_isolated(cfg, arena, 0, 1, *root),
+              "切触方程迭代到实际根而非一次Newton估计或舍入平台");
     }
     {
         Config cfg;
