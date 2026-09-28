@@ -98,6 +98,15 @@ class ExecutableDiscoveryTests(unittest.TestCase):
 
 
 class RuntimeEnvironmentTests(unittest.TestCase):
+    def test_loopback_listener_does_not_reverse_resolve_its_address(self):
+        with patch.object(web.socket, "getfqdn", side_effect=AssertionError("DNS lookup")):
+            server = web.create_http_server("127.0.0.1", 0, web.BaseHTTPRequestHandler)
+        try:
+            self.assertEqual(server.server_name, "127.0.0.1")
+            self.assertEqual(server.server_port, server.server_address[1])
+        finally:
+            server.server_close()
+
     def test_linux_frozen_restores_original_library_path(self):
         for original in (None, "", "/opt/user-libraries"):
             environment = {"LD_LIBRARY_PATH": "/tmp/_MEI/private", "UNCHANGED": "yes"}

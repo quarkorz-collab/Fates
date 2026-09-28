@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import signal
 import socket
+import socketserver
 import subprocess
 import sys
 import threading
@@ -572,6 +573,11 @@ class FatesHttpServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 32
+
+    def server_bind(self) -> None:
+        # HTTPServer reverse-resolves server_name; loopback URLs need no DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 class FatesIPv6HttpServer(FatesHttpServer):
