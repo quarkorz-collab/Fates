@@ -101,7 +101,7 @@
             <label class="field field-wide">
               <span>参数文件 <code>--args-file</code></span>
               <input id="argsFile" type="text" data-option="--args-file" data-default="" placeholder="例如 examples\24-point.args">
-              <small>UTF-8 参数文件可包含 TARGET；相对路径按 fates.exe 所在目录解释。</small>
+              <small>UTF-8 参数文件可包含 TARGET；相对路径按 Fates 引擎所在目录解释。</small>
             </label>
             <label class="field field-wide">
               <span>控制动作</span>
@@ -116,7 +116,7 @@
           </div>
         </details>
 
-        <details class="option-group" open data-search-text="digits constants operator literal integer cost custom symbol count order atoms 数字 常数 运算符 次数 顺序 原子">
+        <details class="option-group" open data-search-text="digits constants operator literal integer cost custom symbol count group total order atoms 数字 常数 运算符 次数 合计 总数 分组 顺序 原子">
           <summary>
             <span><b>02</b> 原子、运算与约束</span>
             <small>Atoms &amp; grammar</small>
@@ -143,7 +143,7 @@
             <label class="field field-wide">
               <span>内置常数 <code>--constants</code></span>
               <input id="constants" type="text" value="pi,e,phi" data-option="--constants" data-default="pi,e,phi" data-empty-equals="true">
-              <small>可追加成本，如 <code>pi:2</code>；写 none 禁用。下方目录由当前 fates.exe 动态提供。</small>
+              <small>可追加成本，如 <code>pi:2</code>；写 none 禁用。下方目录由当前 Fates 引擎动态提供。</small>
             </label>
             <div class="symbol-catalog field-wide" aria-labelledby="constantCatalogTitle">
               <div class="catalog-heading">
@@ -181,6 +181,11 @@
             <label class="field field-wide">
               <span>符号次数 <code>--symbol-count</code> · 每行一项</span>
               <textarea id="symbolCounts" rows="3" placeholder="pi=2:4&#10;e=0"></textarea>
+            </label>
+            <label class="field field-wide">
+              <span>常数合计次数 <code>--constant-count</code> · 每行一组</span>
+              <textarea id="constantCounts" rows="2" placeholder="pi,e,phi=1:3&#10;e,gamma=0:2"></textarea>
+              <small>每组至少两个已启用的常数；统计整条表达式中的总出现次数，方程统计等号两侧。上界可写 inf。</small>
             </label>
             <label class="field field-wide">
               <span>叶子顺序 <code>--symbol-order</code></span>
@@ -603,8 +608,8 @@
             <button id="copyCommand" type="button" class="quiet-button">复制命令</button>
           </div>
         </div>
-        <textarea id="commandPreview" rows="3" spellcheck="false" aria-label="可编辑的 Fates PowerShell 命令">.\fates.exe 520.82418 --json</textarea>
-        <div class="command-hint">可粘贴或直接修改 PowerShell 风格命令，再点“导入到表单”。支持引号、<code>--name=value</code>、重复常数和符号次数。</div>
+        <textarea id="commandPreview" rows="3" spellcheck="false" aria-label="可编辑的 Fates 命令">fates 520.82418 --json</textarea>
+        <div class="command-hint">可粘贴或直接修改 <span id="commandShellLabel">本机 shell</span> 风格命令，再点“导入到表单”。支持引号、续行、<code>--name=value</code>、重复常数和符号次数；不执行 shell 展开。</div>
         <div class="validation-message" id="validationMessage" aria-live="polite"></div>
         <div class="action-row">
           <button id="runButton" type="button" class="primary-button">
@@ -677,7 +682,7 @@
 
   <footer>
     <span>Fates Local Studio</span>
-    <span>仅监听本机回环地址 · 命令不经过 shell · 搜索由本地 fates.exe 执行</span>
+    <span>仅监听本机回环地址 · 命令不经过 shell · 搜索由本地 Fates 引擎执行</span>
   </footer>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>

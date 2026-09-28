@@ -313,10 +313,12 @@ struct AtomSpec {
     double value{};
     std::uint16_t cost{};
     bool variable{};
+    bool constant{};
 };
 
 struct SymbolCountRule {
     std::string symbol;
+    std::vector<std::string> group_symbols;
     std::uint32_t minimum{};
     std::uint32_t maximum{};
     std::uint16_t atom_cost{};
@@ -327,6 +329,7 @@ struct SymbolCountRule {
 
 struct SymbolConstraintPlan {
     std::vector<SymbolCountRule> count_rules;
+    std::size_t constant_count_rules{};
     std::vector<std::string> required_order;
     std::vector<std::uint16_t> order_atom_cost;
     std::uint32_t order_symbol_mask{};
@@ -452,6 +455,7 @@ struct Config {
     std::vector<std::string> custom_constants;
     std::string ops = "+,-,*,/,^,neg,inv,sqrt,ln,exp";
     std::vector<std::string> symbol_count_specs;
+    std::vector<std::string> constant_count_specs;
     std::vector<std::string> required_symbol_order;
     SymbolConstraintPlan symbol_constraints;
     ExtensionConstraintPlan extension_constraints;
@@ -1566,7 +1570,7 @@ static std::vector<AtomSpec> build_atoms(const Config& cfg) {
             if (cost == 0 || cost > std::numeric_limits<std::uint16_t>::max()) {
                 throw std::runtime_error("内置常数成本必须在 1..65535 之间: " + raw);
             }
-            if (cost <= cfg.max_cost) atoms.push_back({name, it->second, static_cast<std::uint16_t>(cost)});
+            if (cost <= cfg.max_cost) atoms.push_back({name, it->second, static_cast<std::uint16_t>(cost), false, true});
         }
     }
 
@@ -1589,7 +1593,7 @@ static std::vector<AtomSpec> build_atoms(const Config& cfg) {
         if (cost == 0 || cost > std::numeric_limits<std::uint16_t>::max()) {
             throw std::runtime_error("自定义常数成本必须在 1..65535 之间: " + spec);
         }
-        if (cost <= cfg.max_cost) atoms.push_back({name, value, static_cast<std::uint16_t>(cost)});
+        if (cost <= cfg.max_cost) atoms.push_back({name, value, static_cast<std::uint16_t>(cost), false, true});
     }
 
     if (cfg.equations && cfg.max_cost >= 1) {
@@ -1615,7 +1619,8 @@ struct ParsedCountBound {
     std::uint64_t value{};
 };
 
-static ParsedCountBound parse_count_bound(std::string text, std::string_view position) {
+static ParsedCountBound parse_count_bound(std::string text, std::string_view position,
+                                          std::string_view option) {
     text = trim(std::move(text));
     std::string lowered = text;
     for (char& c : lowered) {
@@ -1626,13 +1631,13 @@ static ParsedCountBound parse_count_bound(std::string text, std::string_view pos
         return {true, 0};
     }
     if (text.empty() || text.front() == '-') {
-        throw std::runtime_error("--symbol-count " + std::string(position) + "不是非负整数或 inf: " + text);
+        throw std::runtime_error(std::string(option) + " " + std::string(position) + "不是非负整数或 inf: " + text);
     }
     errno = 0;
     char* end = nullptr;
     const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
     if (errno == ERANGE || end == text.c_str() || *end != '\0') {
-        throw std::runtime_error("--symbol-count " + std::string(position) + "不是非负整数或 inf: " + text);
+        throw std::runtime_error(std::string(option) + " " + std::string(position) + "不是非负整数或 inf: " + text);
     }
     return {false, static_cast<std::uint64_t>(value)};
 }
@@ -1643,41 +1648,72 @@ struct ParsedCountSpec {
     std::optional<std::uint64_t> maximum;
 };
 
-static ParsedCountSpec parse_symbol_count_spec(const std::string& text) {
-    const auto equal = text.find('=');
-    if (equal == std::string::npos || equal == 0 || text.find('=', equal + 1) != std::string::npos) {
-        throw std::runtime_error("--symbol-count 格式应为 NAME=N 或 NAME=MIN:MAX: " + text);
-    }
+static ParsedCountSpec parse_count_range(const std::string& text, std::string_view option) {
     ParsedCountSpec parsed;
-    parsed.symbol = trim(text.substr(0, equal));
-    if (parsed.symbol.empty()) {
-        throw std::runtime_error("--symbol-count 的符号名不能为空: " + text);
-    }
-
-    const std::string range = trim(text.substr(equal + 1));
+    const std::string range = trim(text);
     const auto colon = range.find(':');
     if (colon == std::string::npos) {
-        const ParsedCountBound exact = parse_count_bound(range, "次数");
+        const ParsedCountBound exact = parse_count_bound(range, "次数", option);
         if (exact.infinite) {
-            throw std::runtime_error("--symbol-count 的最小次数不能为 inf；有限成本表达式无法出现无限次: " + text);
+            throw std::runtime_error(std::string(option) + " 的最小次数不能为 inf；有限成本表达式无法出现无限次: " + text);
         }
         parsed.minimum = exact.value;
         parsed.maximum = exact.value;
     } else {
         if (range.find(':', colon + 1) != std::string::npos) {
-            throw std::runtime_error("--symbol-count 范围只能包含一个冒号: " + text);
+            throw std::runtime_error(std::string(option) + " 范围只能包含一个冒号: " + text);
         }
-        const ParsedCountBound lower = parse_count_bound(range.substr(0, colon), "下界");
-        const ParsedCountBound upper = parse_count_bound(range.substr(colon + 1), "上界");
+        const ParsedCountBound lower = parse_count_bound(range.substr(0, colon), "下界", option);
+        const ParsedCountBound upper = parse_count_bound(range.substr(colon + 1), "上界", option);
         if (lower.infinite) {
-            throw std::runtime_error("--symbol-count 的最小次数不能为 inf；有限成本表达式无法出现无限次: " + text);
+            throw std::runtime_error(std::string(option) + " 的最小次数不能为 inf；有限成本表达式无法出现无限次: " + text);
         }
         parsed.minimum = lower.value;
         if (!upper.infinite) parsed.maximum = upper.value;
     }
     if (parsed.maximum && parsed.minimum > *parsed.maximum) {
-        throw std::runtime_error("--symbol-count 下界不能大于上界: " + text);
+        throw std::runtime_error(std::string(option) + " 下界不能大于上界: " + text);
     }
+    return parsed;
+}
+
+static ParsedCountSpec parse_symbol_count_spec(const std::string& text) {
+    const auto equal = text.find('=');
+    if (equal == std::string::npos || equal == 0 || text.find('=', equal + 1) != std::string::npos) {
+        throw std::runtime_error("--symbol-count 格式应为 NAME=N 或 NAME=MIN:MAX: " + text);
+    }
+    ParsedCountSpec parsed = parse_count_range(text.substr(equal + 1), "--symbol-count");
+    parsed.symbol = trim(text.substr(0, equal));
+    if (parsed.symbol.empty()) {
+        throw std::runtime_error("--symbol-count 的符号名不能为空: " + text);
+    }
+    return parsed;
+}
+
+struct ParsedConstantCountSpec {
+    std::vector<std::string> symbols;
+    std::uint64_t minimum{};
+    std::optional<std::uint64_t> maximum;
+};
+
+static ParsedConstantCountSpec parse_constant_count_spec(const std::string& text) {
+    const auto equal = text.find('=');
+    if (equal == std::string::npos || equal == 0 || text.find('=', equal + 1) != std::string::npos) {
+        throw std::runtime_error("--constant-count 格式应为 NAME,NAME=N 或 NAME,NAME=MIN:MAX: " + text);
+    }
+    ParsedConstantCountSpec parsed;
+    parsed.symbols = split_csv(text.substr(0, equal));
+    if (parsed.symbols.size() < 2 || std::any_of(parsed.symbols.begin(), parsed.symbols.end(),
+        [](const std::string& name) { return name.empty(); })) {
+        throw std::runtime_error("--constant-count 至少需要两个非空常数名: " + text);
+    }
+    std::sort(parsed.symbols.begin(), parsed.symbols.end());
+    if (std::adjacent_find(parsed.symbols.begin(), parsed.symbols.end()) != parsed.symbols.end()) {
+        throw std::runtime_error("--constant-count 同一分组不能重复列出常数: " + text);
+    }
+    const ParsedCountSpec range = parse_count_range(text.substr(equal + 1), "--constant-count");
+    parsed.minimum = range.minimum;
+    parsed.maximum = range.maximum;
     return parsed;
 }
 
@@ -1690,11 +1726,13 @@ std::optional<std::uint32_t> SymbolConstraintPlan::atom_state(std::string_view s
     if (!active) return 0U;
     std::uint32_t state = 0;
     for (const SymbolCountRule& rule : count_rules) {
-        if (rule.symbol != symbol) continue;
+        if (rule.symbol != symbol &&
+            std::find(rule.group_symbols.begin(), rule.group_symbols.end(), symbol) == rule.group_symbols.end()) {
+            continue;
+        }
         if (!rule.unlimited && rule.maximum == 0) return std::nullopt;
         const std::uint32_t stored = rule.unlimited ? std::min<std::uint32_t>(1U, rule.minimum) : 1U;
         if (rule.bits != 0) state |= stored << rule.shift;
-        break;
     }
 
     if (!required_order.empty()) {
@@ -1765,11 +1803,14 @@ bool SymbolConstraintPlan::can_finish(std::uint32_t state, unsigned current_cost
     if (maximum_missing_atom_cost <= static_cast<std::uint64_t>(max_cost - current_cost)) return true;
 
     std::uint64_t count_cost = 0;
+    std::uint64_t group_cost = 0;
     for (const SymbolCountRule& rule : count_rules) {
         const std::uint32_t count = count_field(state, rule);
         if (count < rule.minimum) {
-            count_cost = saturating_add(
-                count_cost, saturating_mul(static_cast<std::uint64_t>(rule.minimum - count), rule.atom_cost));
+            const std::uint64_t missing = saturating_mul(
+                static_cast<std::uint64_t>(rule.minimum - count), rule.atom_cost);
+            if (rule.group_symbols.empty()) count_cost = saturating_add(count_cost, missing);
+            else group_cost = std::max(group_cost, missing);
         }
     }
 
@@ -1794,7 +1835,7 @@ bool SymbolConstraintPlan::can_finish(std::uint32_t state, unsigned current_cost
             if (order_cost == std::numeric_limits<std::uint64_t>::max()) return false;
         }
     }
-    const std::uint64_t missing_cost = std::max(count_cost, order_cost);
+    const std::uint64_t missing_cost = std::max({count_cost, group_cost, order_cost});
     return missing_cost <= static_cast<std::uint64_t>(max_cost - current_cost);
 }
 
@@ -1802,12 +1843,17 @@ static SymbolConstraintPlan compile_symbol_constraints(const Config& cfg,
                                                        const std::vector<AtomSpec>& atoms) {
     SymbolConstraintPlan plan;
     plan.max_cost = cfg.max_cost;
-    if (cfg.symbol_count_specs.empty() && cfg.required_symbol_order.empty()) return plan;
+    if (cfg.symbol_count_specs.empty() && cfg.constant_count_specs.empty() &&
+        cfg.required_symbol_order.empty()) return plan;
 
     std::map<std::string, std::uint16_t> atom_costs;
+    std::set<std::string> constant_names;
+    std::set<std::string> nonconstant_names;
     for (const AtomSpec& atom : atoms) {
         const auto [it, inserted] = atom_costs.emplace(atom.text, atom.cost);
         if (!inserted) it->second = std::min(it->second, atom.cost);
+        if (atom.constant) constant_names.insert(atom.text);
+        else nonconstant_names.insert(atom.text);
     }
 
     struct MergedRange {
@@ -1869,6 +1915,67 @@ static SymbolConstraintPlan compile_symbol_constraints(const Config& cfg,
         plan.count_rules.push_back(std::move(rule));
     }
 
+    std::map<std::vector<std::string>, MergedRange> groups;
+    for (const std::string& text : cfg.constant_count_specs) {
+        const ParsedConstantCountSpec parsed = parse_constant_count_spec(text);
+        for (const std::string& name : parsed.symbols) {
+            if (!constant_names.contains(name)) {
+                throw std::runtime_error("--constant-count 常数 '" + name +
+                                         "' 未启用，或其成本超过 --max-cost");
+            }
+            if (nonconstant_names.contains(name)) {
+                throw std::runtime_error("--constant-count 常数 '" + name +
+                                         "' 与数字字面量或变量同名，无法区分出现次数");
+            }
+        }
+        auto [it, inserted] = groups.emplace(parsed.symbols, MergedRange{parsed.minimum, parsed.maximum});
+        if (!inserted) {
+            it->second.minimum = std::max(it->second.minimum, parsed.minimum);
+            if (it->second.maximum && parsed.maximum) {
+                it->second.maximum = std::min(*it->second.maximum, *parsed.maximum);
+            } else if (parsed.maximum) {
+                it->second.maximum = parsed.maximum;
+            }
+        }
+        if (it->second.maximum && it->second.minimum > *it->second.maximum) {
+            throw std::runtime_error("--constant-count 同一分组的重复范围互相冲突: " + text);
+        }
+    }
+
+    for (const auto& [symbols, range] : groups) {
+        std::uint16_t cheapest = std::numeric_limits<std::uint16_t>::max();
+        for (const std::string& name : symbols) cheapest = std::min(cheapest, atom_costs.at(name));
+        const std::uint64_t feasible = cfg.max_cost / cheapest;
+        if (range.minimum > feasible) {
+            throw std::runtime_error("--constant-count 最少出现 " + std::to_string(range.minimum) +
+                                     " 次，但 --max-cost 下最多只能出现 " + std::to_string(feasible) + " 次");
+        }
+        const bool unlimited = !range.maximum || *range.maximum >= feasible;
+        const std::uint64_t effective_max = unlimited ? range.minimum : *range.maximum;
+        if (effective_max > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::runtime_error("--constant-count 次数超出内部状态范围");
+        }
+        if (unlimited && range.minimum == 0) continue;
+
+        SymbolCountRule rule;
+        rule.group_symbols = symbols;
+        rule.minimum = static_cast<std::uint32_t>(range.minimum);
+        rule.maximum = static_cast<std::uint32_t>(effective_max);
+        rule.atom_cost = cheapest;
+        rule.shift = static_cast<std::uint8_t>(used_bits);
+        rule.bits = static_cast<std::uint8_t>(bits_for_u32(rule.maximum));
+        rule.unlimited = unlimited;
+        used_bits += rule.bits;
+        if (used_bits > 32) {
+            throw std::runtime_error("常数总次数与符号约束状态合计超过 32 位；请减少分组或缩小最大次数");
+        }
+        if (!rule.unlimited && rule.maximum == 1 && rule.bits == 1) {
+            plan.unit_once_mask |= std::uint32_t{1} << rule.shift;
+        }
+        plan.count_rules.push_back(std::move(rule));
+        ++plan.constant_count_rules;
+    }
+
     plan.required_order = cfg.required_symbol_order;
     if (!plan.required_order.empty()) {
         if (plan.required_order.size() > 31) {
@@ -1886,6 +1993,20 @@ static SymbolConstraintPlan compile_symbol_constraints(const Config& cfg,
             ++order_counts[symbol];
         }
         for (const SymbolCountRule& rule : plan.count_rules) {
+            if (!rule.group_symbols.empty()) {
+                std::uint32_t occurrences = 0;
+                bool all_controlled = true;
+                for (const std::string& name : rule.group_symbols) {
+                    const auto found = order_counts.find(name);
+                    if (found != order_counts.end()) occurrences += found->second;
+                    else all_controlled = false;
+                }
+                if ((!rule.unlimited && rule.maximum < occurrences) ||
+                    (all_controlled && rule.minimum > occurrences)) {
+                    throw std::runtime_error("--constant-count 与 --symbol-order 的次数要求冲突");
+                }
+                continue;
+            }
             const auto found = order_counts.find(rule.symbol);
             if (found == order_counts.end()) continue;
             const std::uint32_t occurrences = found->second;
@@ -1907,16 +2028,21 @@ static SymbolConstraintPlan compile_symbol_constraints(const Config& cfg,
 
     plan.active = !plan.count_rules.empty() || !plan.required_order.empty();
     std::uint64_t count_requirement_cost = 0;
+    std::uint64_t group_requirement_cost = 0;
     for (const SymbolCountRule& rule : plan.count_rules) {
-        count_requirement_cost = saturating_add(
-            count_requirement_cost,
-            saturating_mul(static_cast<std::uint64_t>(rule.minimum), rule.atom_cost));
+        const std::uint64_t required = saturating_mul(rule.minimum, rule.atom_cost);
+        if (rule.group_symbols.empty()) {
+            count_requirement_cost = saturating_add(count_requirement_cost, required);
+        } else {
+            group_requirement_cost = std::max(group_requirement_cost, required);
+        }
     }
     std::uint64_t order_requirement_cost = 0;
     for (const std::uint16_t cost : plan.order_atom_cost) {
         order_requirement_cost = saturating_add(order_requirement_cost, cost);
     }
-    plan.maximum_missing_atom_cost = std::max(count_requirement_cost, order_requirement_cost);
+    plan.maximum_missing_atom_cost = std::max({count_requirement_cost, group_requirement_cost,
+                                               order_requirement_cost});
     if (plan.active && !plan.can_finish(0, 0)) {
         throw std::runtime_error("符号约束所需的原子成本已经超过 --max-cost");
     }
@@ -3663,7 +3789,10 @@ public:
                       << "  \"digits\": \"" << json_escape(cfg_.digits) << "\",\n"
                       << "  \"constants\": \"" << json_escape(cfg_.constants) << "\",\n"
                       << "  \"operators\": \"" << json_escape(cfg_.ops) << "\",\n"
-                      << "  \"symbol_count_rules\": " << cfg_.symbol_constraints.count_rules.size() << ",\n"
+                      << "  \"symbol_count_rules\": "
+                      << (cfg_.symbol_constraints.count_rules.size() - cfg_.symbol_constraints.constant_count_rules)
+                      << ",\n"
+                      << "  \"constant_count_rules\": " << cfg_.symbol_constraints.constant_count_rules << ",\n"
                       << "  \"symbol_order_length\": " << cfg_.symbol_constraints.required_order.size() << ",\n"
                       << "  \"extension_constraints\": " << cfg_.extension_constraints.constraints.size() << ",\n"
                       << "  \"equations\": " << (cfg_.equations ? "true" : "false") << ",\n"
@@ -3718,7 +3847,9 @@ public:
                   << "  Digits            : '" << cfg_.digits << "'\n"
                   << "  Constants         : '" << cfg_.constants << "'\n"
                   << "  Operators         : '" << cfg_.ops << "'\n"
-                  << "  Count / order     : " << cfg_.symbol_constraints.count_rules.size() << " / "
+                  << "  Count / groups / order: "
+                  << (cfg_.symbol_constraints.count_rules.size() - cfg_.symbol_constraints.constant_count_rules)
+                  << " / " << cfg_.symbol_constraints.constant_count_rules << " / "
                   << cfg_.symbol_constraints.required_order.size() << '\n'
                   << "  Extensions        : " << extension_registry().unary_operations().size() << " unary / "
                   << extension_registry().binary_operations().size() << " binary / "
@@ -9181,6 +9312,7 @@ static void print_help(const char* program) {
         << "  --constants LIST          内置常数列表，默认 pi,e,phi；none 表示禁用\n"
         << "  --constant NAME=VALUE[:C] 添加自定义常数，可重复\n"
         << "  --symbol-count SPEC       原子出现次数 NAME=N 或 NAME=MIN:MAX，可重复；MAX 可为 inf\n"
+        << "  --constant-count SPEC     多个常数总出现次数 NAME,NAME=N 或 NAME,NAME=MIN:MAX；可重复，MAX 可为 inf\n"
         << "  --symbol-order LIST       受控叶子必须按此顺序出现，如 1,1,4,5,1,4；none 清除\n"
         << "  --args-file FILE          从 UTF-8 参数文件读取选项；支持引号、# 注释和最多 8 层嵌套\n"
         << "  @FILE                     --args-file 简写；'@@TEXT' 转义为普通参数 '@TEXT'\n"
@@ -9644,6 +9776,8 @@ static Config parse_cli(int argc, char** argv) {
             cfg.custom_constants.push_back(option_value(i, argc, argv, arg, "--constant"));
         } else if (option_matches(arg, "--symbol-count")) {
             cfg.symbol_count_specs.push_back(option_value(i, argc, argv, arg, "--symbol-count"));
+        } else if (option_matches(arg, "--constant-count")) {
+            cfg.constant_count_specs.push_back(option_value(i, argc, argv, arg, "--constant-count"));
         } else if (option_matches(arg, "--symbol-order")) {
             cfg.required_symbol_order = parse_symbol_order(
                 option_value(i, argc, argv, arg, "--symbol-order"));
@@ -10539,6 +10673,130 @@ static int run_self_test() {
         check(exact.symbol == "pi" && exact.minimum == 4 && exact.maximum == 4 &&
                   ranged.minimum == 2 && !ranged.maximum,
               "符号次数 exact/inf 语法");
+    }
+    {
+        const ParsedConstantCountSpec ranged = parse_constant_count_spec(" phi , pi = 2 : inf ");
+        const ParsedConstantCountSpec exact = parse_constant_count_spec("pi,e=3");
+        check(ranged.symbols == std::vector<std::string>{"phi", "pi"} &&
+                  ranged.minimum == 2 && !ranged.maximum &&
+                  exact.minimum == 3 && exact.maximum == 3,
+              "多常数总次数解析支持闭区间、精确值和无限上限");
+    }
+    {
+        Config cfg;
+        cfg.digits = "";
+        cfg.constants = "pi,e,phi";
+        cfg.max_cost = 9;
+        cfg.constant_count_specs = {"pi,e=2:3", "pi,phi=0:1"};
+        const auto plan = compile_symbol_constraints(cfg, build_atoms(cfg));
+        const auto pi = plan.atom_state("pi");
+        const auto e = plan.atom_state("e");
+        const auto phi = plan.atom_state("phi");
+        const std::uint32_t e_state = e.value_or(0U);
+        const auto two_e = plan.combine(e_state, e_state);
+        const auto pi_e = pi && e ? plan.combine(*pi, *e) : std::nullopt;
+        const auto pi_e_phi = pi_e && phi ? plan.combine(*pi_e, *phi) : std::nullopt;
+        const auto e_phi = e && phi ? plan.combine(*e, *phi) : std::nullopt;
+        const std::uint32_t two_e_state = two_e.value_or(0U);
+        const auto four_e = plan.combine(two_e_state, two_e_state);
+        check(plan.constant_count_rules == 2 && pi && e && phi && two_e && pi_e && e_phi &&
+                  plan.satisfied(*two_e) && plan.satisfied(*pi_e) && !plan.satisfied(*e_phi) &&
+                  !pi_e_phi && !four_e,
+              "重叠常数分组独立计数、终检与组合时上限剪枝");
+    }
+    {
+        Config cfg;
+        cfg.digits = "";
+        cfg.constants = "pi,e,phi";
+        cfg.max_cost = 6;
+        cfg.constant_count_specs = {"pi,e=3:inf", "e,phi=0"};
+        const auto plan = compile_symbol_constraints(cfg, build_atoms(cfg));
+        const auto pi = plan.atom_state("pi");
+        const auto twice = pi ? plan.combine(*pi, *pi) : std::nullopt;
+        const auto thrice = twice ? plan.combine(*twice, *pi) : std::nullopt;
+        const auto four = thrice ? plan.combine(*thrice, *pi) : std::nullopt;
+        check(plan.constant_count_rules == 2 && pi && twice && thrice && four &&
+                  !plan.can_finish(*pi, 5) && plan.can_finish(*twice, 3) &&
+                  plan.satisfied(*thrice) && plan.satisfied(*four) &&
+                  !plan.atom_state("e") && !plan.atom_state("phi"),
+              "常数分组无限上限饱和、零上限与剩余成本剪枝");
+    }
+    {
+        Config cfg;
+        cfg.digits = "";
+        cfg.constants = "pi,e,phi";
+        cfg.max_cost = 8;
+        cfg.constant_count_specs = {"e,pi=1:3", "pi,e=2:2"};
+        const auto merged = compile_symbol_constraints(cfg, build_atoms(cfg));
+        const auto pi = merged.atom_state("pi");
+        const auto e = merged.atom_state("e");
+        const auto both = pi && e ? merged.combine(*pi, *e) : std::nullopt;
+        bool rejected = false;
+        try {
+            cfg.constant_count_specs = {"pi,pi=1"};
+            (void)compile_symbol_constraints(cfg, build_atoms(cfg));
+        } catch (const std::runtime_error&) { rejected = true; }
+        check(merged.constant_count_rules == 1 && both && merged.satisfied(*both) && rejected,
+              "同组重复区间合并且拒绝分组内重复常数");
+    }
+    {
+        Config cfg;
+        cfg.digits = "12";
+        cfg.constants = "pi,e";
+        cfg.custom_constants = {"G=0.915965594177219:2"};
+        cfg.max_cost = 8;
+        cfg.symbol_count_specs = {"pi=1:2"};
+        cfg.constant_count_specs = {"pi,G=2:3"};
+        const auto plan = compile_symbol_constraints(cfg, build_atoms(cfg));
+        const auto pi = plan.atom_state("pi");
+        const auto custom = plan.atom_state("G");
+        const auto digit = plan.atom_state("1");
+        const auto combined = pi && custom ? plan.combine(*pi, *custom) : std::nullopt;
+        const auto with_digit = combined && digit ? plan.combine(*combined, *digit) : std::nullopt;
+        check(pi && custom && combined && with_digit && plan.satisfied(*combined) &&
+                  plan.satisfied(*with_digit) && !plan.satisfied(*pi),
+              "自定义常数参与合计；数字不计入，独立符号次数仍生效");
+    }
+    {
+        Config cfg;
+        cfg.digits = "";
+        cfg.constants = "pi,e";
+        cfg.max_cost = 7;
+        cfg.equations = true;
+        cfg.constant_count_specs = {"pi,e=2:2"};
+        const auto plan = compile_symbol_constraints(cfg, build_atoms(cfg));
+        const auto x = plan.atom_state("x");
+        const auto pi = plan.atom_state("pi");
+        const auto e = plan.atom_state("e");
+        const auto lhs = plan.combine(x.value_or(0U), pi.value_or(0U));
+        const auto rhs = plan.combine(e.value_or(0U), 0U);
+        const auto equation = plan.combine(lhs.value_or(0U), rhs.value_or(0U));
+        check(x && pi && e && lhs && rhs && equation && !plan.satisfied(lhs.value_or(0U)) &&
+                  plan.satisfied(equation.value_or(0U)),
+              "方程左右两侧合计常数次数");
+    }
+    {
+        Config cfg;
+        cfg.digits = "";
+        cfg.constants = "pi,e,phi";
+        cfg.max_cost = 6;
+        const auto rejects = [&](std::vector<std::string> specs) {
+            cfg.constant_count_specs = std::move(specs);
+            try { (void)compile_symbol_constraints(cfg, build_atoms(cfg)); }
+            catch (const std::runtime_error&) { return true; }
+            return false;
+        };
+        const bool invalid = rejects({"pi=2"}) && rejects({"pi,=2"}) &&
+            rejects({"pi,pi=2"}) && rejects({"pi,unknown=2"}) &&
+            rejects({"pi,e=inf"}) && rejects({"pi,e=2:1"}) &&
+            rejects({"pi,e=1:2", "e,pi=3:4"}) && rejects({"pi,e=7:inf"});
+        cfg.constant_count_specs = {"pi,e=0:1"};
+        cfg.required_symbol_order = {"pi", "e"};
+        const bool order_upper_conflict = rejects(cfg.constant_count_specs);
+        cfg.constant_count_specs = {"pi,e=3:inf"};
+        const bool order_lower_conflict = rejects(cfg.constant_count_specs);
+        check(invalid && order_upper_conflict && order_lower_conflict,
+              "无效分组、未知常数、重复冲突、不可达下限及顺序冲突报错");
     }
     {
         Config cfg;

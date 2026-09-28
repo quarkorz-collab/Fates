@@ -32,6 +32,16 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Set up Node for WebUI tests
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
       - name: Configure
         run: >-
           cmake -S . -B build
@@ -44,6 +54,25 @@ jobs:
 
       - name: Run CTest
         run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: Run WebUI unit tests
+        shell: bash
+        run: |
+          python -m unittest discover -s tests -p 'test_web*.py'
+          node tests/test_web_commands.cjs
+          node tests/test_web_numbers.cjs
+          node tests/test_web_constant_counts.cjs
+
+      - name: Run WebUI and constant count smoke tests
+        shell: bash
+        run: |
+          binary=build/fates
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            binary=build/Release/fates.exe
+            if [[ ! -f "$binary" ]]; then binary=build/fates.exe; fi
+          fi
+          python tests/check_web.py --bin "$binary"
+          python tests/check_constant_count.py --bin "$binary"
 
       - name: Run command-line regression suite
         if: runner.os == 'Linux'

@@ -104,6 +104,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Self-test failed' }
           & (Join-Path $env:FATES_OUTPUT 'fates-web.exe') --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'Web executable check failed' }
+          $webArguments = @('tests/check_web.py', '--bin', $executable, '--web', (Join-Path $env:FATES_OUTPUT 'fates-web.exe'))
+          & python @webArguments
+          $webExitCode = $LASTEXITCODE
+          if ($webExitCode -ne 0) { throw 'Web smoke test failed' }
+          Copy-Item -LiteralPath frontend\README.md -Destination (Join-Path $env:FATES_OUTPUT 'WEBUI.md')
           $checksumPath = Join-Path $env:FATES_OUTPUT 'SHA256SUMS.txt'
           $lines = Get-ChildItem -LiteralPath $env:FATES_OUTPUT -File -Recurse |
             Where-Object { $_.FullName -ne $checksumPath } |
@@ -131,12 +136,17 @@ jobs:
           if-no-files-found: error
 
   linux-pgo:
-    name: Linux x64 AVX2 PGO
+    name: Linux x64 AVX2 PGO and web
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
 
       - name: Build balanced PGO executable
         shell: bash
@@ -148,11 +158,21 @@ jobs:
             --training balanced
           echo "FATES_OUTPUT=$output" >> "$GITHUB_ENV"
 
+      - name: Build web executable
+        shell: bash
+        run: bash frontend/build_web.sh --python python --output "$FATES_OUTPUT"
+
       - name: Verify and package
         shell: bash
         run: |
           "$FATES_OUTPUT/fates" --version
           "$FATES_OUTPUT/fates" --self-test
+          python tests/check_web.py --bin "$FATES_OUTPUT/fates" --web "$FATES_OUTPUT/fates-web"
+          cp frontend/README.md "$FATES_OUTPUT/WEBUI.md"
+          printf 'webui=true\n' >> "$FATES_OUTPUT/build-info.txt"
+          # The engine build generated checksums before the WebUI was added.
+          (cd "$FATES_OUTPUT" && find . -type f ! -name SHA256SUMS.txt -print | LC_ALL=C sort |
+            while IFS= read -r file; do sha256sum "$file"; done > SHA256SUMS.txt)
           archive="$RUNNER_TEMP/fates-linux-x64-pgo-avx2.tar.gz"
           tar --owner=0 --group=0 --numeric-owner \
             -C "$RUNNER_TEMP" -czf "$archive" fates-linux-x64-pgo-avx2
@@ -177,7 +197,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux x64 portable
+          - name: Linux x64 portable and web
             os: ubuntu-22.04
             package: fates-linux-x64-portable
           - name: macOS portable
@@ -187,6 +207,12 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+
+      - name: Set up Python for Linux WebUI
+        if: runner.os == 'Linux'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
 
       - name: Configure
         run: >-
@@ -211,6 +237,12 @@ jobs:
           cp third_party/pdqsort/LICENSE "$output/licenses/pdqsort-LICENSE"
           cp frontend/static/vendor/katex/LICENSE "$output/licenses/KaTeX-LICENSE"
           printf 'Fates 1.0\ntoolchain=%s\npgo=false\navx2=false\n' "${CXX:-c++}" > "$output/build-info.txt"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            bash frontend/build_web.sh --python python --output "$output"
+            python tests/check_web.py --bin "$output/fates" --web "$output/fates-web"
+            cp frontend/README.md "$output/WEBUI.md"
+            printf 'webui=true\n' >> "$output/build-info.txt"
+          fi
           if command -v sha256sum >/dev/null 2>&1; then
             (cd "$output" && find . -type f ! -name SHA256SUMS.txt -print | LC_ALL=C sort | while IFS= read -r file; do sha256sum "$file"; done > SHA256SUMS.txt)
           else

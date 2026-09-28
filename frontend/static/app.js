@@ -50,6 +50,8 @@ const advancedPolicies = {
 };
 
 let symbolCatalog = null;
+let commandShell = "powershell";
+let commandDirty = false;
 
 const runtime = {
   jobId: null,
@@ -206,6 +208,9 @@ function buildArguments() {
   for (const value of lines(element("symbolCounts").value)) {
     args.push("--symbol-count", value);
   }
+  for (const value of lines(element("constantCounts").value)) {
+    args.push("--constant-count", value);
+  }
   return args;
 }
 
@@ -268,6 +273,79 @@ function quotePowerShell(value) {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
+function quotePosix(value) {
+  if (/^[A-Za-z0-9_./:=+,-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+function formatCommand(args, shell = commandShell) {
+  const posix = shell === "posix";
+  return [posix ? "./fates" : ".\\fates.exe", ...args.map(posix ? quotePosix : quotePowerShell)].join(" ");
+}
+
+function tokenizePosix(command) {
+  const tokens = [];
+  let current = "";
+  let state = "bare";
+  let started = false;
+  const push = () => {
+    if (started) tokens.push(current);
+    current = "";
+    started = false;
+  };
+
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    const next = command[index + 1];
+    if (state === "single") {
+      if (character === "'") state = "bare";
+      else current += character;
+      continue;
+    }
+    if (character === "\\") {
+      if (next === undefined) throw new Error("命令末尾存在未完成的反斜杠转义。");
+      if (next === "\n") { index += 1; continue; }
+      if (next === "\r" && command[index + 2] === "\n") { index += 2; continue; }
+      if (state === "bare" || ['"', "\\", "$", "`"].includes(next)) {
+        current += next;
+        started = true;
+        index += 1;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (character === "$" || character === "`") {
+      throw new Error("命令导入不执行 shell 展开；包含 $ 或反引号的参数请使用单引号或反斜杠转义。");
+    }
+    if (state === "double") {
+      if (character === '"') state = "bare";
+      else current += character;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      push();
+    } else if (character === "#" && !started) {
+      while (index + 1 < command.length && command[index + 1] !== "\n") index += 1;
+    } else if (character === "'" || character === '"') {
+      state = character === "'" ? "single" : "double";
+      started = true;
+    } else if (";|&<>".includes(character)) {
+      throw new Error("命令导入只接受 Fates 参数，不支持 shell 管道、重定向或多条命令。");
+    } else {
+      current += character;
+      started = true;
+    }
+  }
+  if (state !== "bare") throw new Error("命令中存在未闭合的引号。");
+  push();
+  return tokens;
+}
+
+function tokenizeCommand(command, shell = commandShell) {
+  return shell === "posix" ? tokenizePosix(command) : tokenizePowerShell(command);
+}
+
 function tokenizePowerShell(command) {
   const tokens = [];
   let current = "";
@@ -319,10 +397,10 @@ function tokenizePowerShell(command) {
       state = "double";
       started = true;
     } else if (character === "`" && next !== undefined) {
-      started = true;
       if (next === "\r" && command[index + 2] === "\n") index += 2;
       else if (next === "\n") index += 1;
       else {
+        started = true;
         current += next;
         index += 1;
       }
@@ -460,7 +538,7 @@ function importCommand() {
     checked: control.checked,
   }));
   try {
-    const tokens = tokenizePowerShell(commandPreview.value.trim());
+    const tokens = tokenizeCommand(commandPreview.value.trim());
     if (!tokens.length) throw new Error("命令为空。");
     if (tokens[0] === "&") tokens.shift();
     if (tokens.length && isExecutableToken(tokens[0])) tokens.shift();
@@ -470,6 +548,7 @@ function importCommand() {
     element("target").value = "";
     element("customConstants").value = "";
     element("symbolCounts").value = "";
+    element("constantCounts").value = "";
     element("symbolOrder").value = "";
     element("utilityAction").value = "";
     element("includeDefaults").checked = false;
@@ -480,6 +559,7 @@ function importCommand() {
     );
     const constants = [];
     const counts = [];
+    const constantCounts = [];
     const utilities = new Map([
       ["--help", "--help"], ["-h", "--help"], ["--version", "--version"],
       ["--list-symbols", "--list-symbols"], ["--self-test", "--self-test"],
@@ -518,10 +598,11 @@ function importCommand() {
         element(policy.control).value = policy.value;
         continue;
       }
-      if (option === "--constant" || option === "--symbol-count") {
+      if (option === "--constant" || option === "--symbol-count" || option === "--constant-count") {
         const taken = takeOptionValue(tokens, index, inlineValue, option);
         index = taken.nextIndex;
-        (option === "--constant" ? constants : counts).push(taken.value);
+        (option === "--constant" ? constants : option === "--symbol-count" ? counts : constantCounts)
+          .push(taken.value);
         continue;
       }
 
@@ -545,6 +626,7 @@ function importCommand() {
 
     element("customConstants").value = constants.join("\n");
     element("symbolCounts").value = counts.join("\n");
+    element("constantCounts").value = constantCounts.join("\n");
     clearPresetSelection();
     syncSymbolPickers();
     refreshCommand();
@@ -564,7 +646,8 @@ function importCommand() {
 
 function refreshCommand() {
   const args = buildArguments();
-  commandPreview.value = [".\\fates.exe", ...args.map(quotePowerShell)].join(" ");
+  commandPreview.value = formatCommand(args);
+  commandDirty = false;
   const validation = validateConfiguration(args);
   validationMessage.textContent = validation.message;
   validationMessage.className = `validation-message ${validation.valid ? "ok" : "error"}`;
@@ -579,6 +662,7 @@ function applyPreset(name) {
   element("target").value = preservedTarget;
   element("customConstants").value = "";
   element("symbolCounts").value = "";
+  element("constantCounts").value = "";
   element("symbolOrder").value = "";
   const values = presets[name];
   for (const [id, value] of Object.entries(values)) {
@@ -1069,6 +1153,12 @@ async function initializeServerStatus() {
     const response = await fetch("/api/meta");
     const metadata = await response.json();
     if (!response.ok) throw new Error(metadata.error || `HTTP ${response.status}`);
+    // Use the server's OS, not the browser's (e.g. Windows over an SSH tunnel).
+    commandShell = metadata.command_shell === "posix" ? "posix" : "powershell";
+    const shellLabel = commandShell === "posix" ? "Bash / POSIX shell" : "PowerShell";
+    element("commandShellLabel").textContent = shellLabel;
+    commandPreview.setAttribute("aria-label", `可编辑的 Fates ${shellLabel} 命令`);
+    if (!commandDirty) refreshCommand();
     renderSymbolCatalog(metadata.symbols);
     element("serverDot").classList.add("online");
     element("serverLabel").textContent = "本地服务器已连接";
@@ -1101,6 +1191,7 @@ cancelButton.addEventListener("click", cancelJob);
 element("copyCommand").addEventListener("click", copyCommand);
 element("importCommand").addEventListener("click", importCommand);
 commandPreview.addEventListener("input", () => {
+  commandDirty = true;
   validationMessage.textContent = "命令已修改；请先导入到表单，再开始搜索。";
   validationMessage.className = "validation-message";
   runButton.disabled = true;
@@ -1115,6 +1206,7 @@ element("resetButton").addEventListener("click", () => {
   form.reset();
   element("customConstants").value = "";
   element("symbolCounts").value = "";
+  element("constantCounts").value = "";
   clearPresetSelection();
   refreshCommand();
 });

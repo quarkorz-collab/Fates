@@ -7,7 +7,7 @@ Fates 根据给定的目标值，搜索由数字、常数和运算符组成的�
 项目包含两个入口：
 
 - `fates` / `fates.exe`：命令行程序；
-- `fates-web.exe`：本地网页界面，调用同目录下的 `fates.exe`。
+- `fates-web` / `fates-web.exe`：Linux / Windows 本地网页界面，调用同目录下的原生 Fates 引擎。
 
 
 `pries` / `pries.exe` 是为旧脚本保留的兼容名称，与 `fates` 使用同一份程序代码。
@@ -157,6 +157,16 @@ Windows PowerShell：
 
 `NAME=N` 表示恰好出现 `N` 次，`NAME=MIN:MAX` 表示闭区间。上限可以写成 `inf`、`infinity` 或 `*`。
 
+`--constant-count` 限制多个已启用常数在整条表达式中出现的次数之和，每组至少两个常数，支持内置与 `--constant` 自定义常数：
+
+```powershell
+.\fates.exe 5.859874482048838 --digits= --constants pi,e,phi `
+  --ops '+,-,*,/' --max-cost 7 --constant-count 'pi,e=2:3' `
+  --constant-count 'pi,phi=0:1'
+```
+
+语法为 `NAME,NAME=N` 或 `NAME,NAME=MIN:MAX`，上下界均包含，可重复指定不同分组；同一常数可同时属于多个分组，重复指定同一分组时取区间交集。例如 `pi,e=2:3` 允许 `pi+e`，但不允许只有一个常数的结果。方程模式统计等号两侧的总次数；`--constant-count 'pi,e=0:inf'` 不施加额外限制。分组必须使用当前启用且成本不超过 `--max-cost` 的常数，约束状态与 `--symbol-count`、`--symbol-order` 共享 32 位上限。
+
 `--symbol-order` 约束指定符号在表达式叶子中的顺序：
 
 ```powershell
@@ -253,17 +263,36 @@ JSON 结果同时包含纯文本表达式和 LaTeX 表示。实时 JSON 事件�
 
 ## 本地网页界面
 
-从源码运行：
+Linux 发布包解压后，在 `fates` 所在目录运行 `./fates-web`；无需安装 Python，KaTeX 和字体已内置。Linux 的通用包和 AVX2 PGO 包都包含 WebUI。若复制文件后丢失权限，运行 `chmod +x fates fates-web`。
+
+Linux 从源码运行（需要 Python 3.10+）：
+
+```bash
+python3 frontend/fates_web.py --fates ./build/fates
+```
+
+Windows 从源码运行：
 
 ```powershell
 python .\frontend\fates_web.py --fates .\fates.exe
 ```
 
-服务器只监听回环地址，默认选择空闲端口，并在终端打印访问地址。也可以指定端口或关闭自动打开浏览器：
+服务器只监听回环地址，默认选择空闲端口，并在终端打印访问地址。Linux 无桌面环境可以指定端口、关闭自动打开浏览器：
 
-```powershell
-python .\frontend\fates_web.py --port 9000 --no-browser
+```bash
+./fates-web --port 9000 --no-browser
 ```
+
+远程访问使用 SSH 隧道：在浏览器所在机器运行 `ssh -N -L 9000:127.0.0.1:9000 user@linux-host`，再打开 `http://127.0.0.1:9000/`。Ctrl+C 或 SIGTERM 会取消并回收运行中的搜索。
+
+生成独立的 Linux 程序（需要 Python、pip 和 binutils）：
+
+```bash
+bash frontend/build_web.sh --output build
+./build/fates-web
+```
+
+这里假设已有 `build/fates`；也可以将 `--output` 指向 PGO 引擎目录。必须在对应架构的 Linux 上构建，生成文件的 glibc 兼容性取决于构建系统；CI 使用 Ubuntu 22.04 x86-64。
 
 生成独立的 Windows 程序：
 
@@ -271,7 +300,9 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 .\frontend\build_web.ps1
 ```
 
-脚本将 `fates-web.exe` 写入项目根目录。运行时把它放在 `fates.exe` 旁边即可。
+Windows 脚本将 `fates-web.exe` 写入项目根目录，运行时把它放在 `fates.exe` 旁边即可。`--fates PATH` 可指定其他引擎；Linux 自动查找不会误选 Windows 的 `.exe`。
+
+网页命令框随服务器平台切换 Bash/POSIX 与 PowerShell 格式，支持引号、空参数和续行。构建、无桌面使用和验证说明见 [`frontend/README.md`](frontend/README.md)。
 
 ## 参数参考
 
@@ -349,7 +380,7 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 | `--version` | 显示程序版本 | 关闭 |
 | `-h, --help` | 显示帮助 | 关闭 |
 
-程序还支持 `--max-literal-len`、`--max-integer`、`--digit-cost`、`--constants`、`--constant`、`--symbol-count`、`--symbol-order`、`--ops`、`--max-abs`、`--max-exponent`、`--max-trig-arg`、`--max-atoms` 和 `--args-file`。运行 `fates --help` 或 `fates --list-symbols --json` 查看当前二进制的完整目录。
+程序还支持 `--max-literal-len`、`--max-integer`、`--digit-cost`、`--constants`、`--constant`、`--symbol-count`、`--constant-count`、`--symbol-order`、`--ops`、`--max-abs`、`--max-exponent`、`--max-trig-arg`、`--max-atoms` 和 `--args-file`。运行 `fates --help` 或 `fates --list-symbols --json` 查看当前二进制的完整目录。
 
 ## 实现概览
 
@@ -376,6 +407,12 @@ python .\frontend\fates_web.py --port 9000 --no-browser
 ```
 
 CMake 构建使用 CTest 注册同一项自测。完整命令行回归位于 `tests/smoke.sh`；容器后端比较位于 `tests/benchmark_containers.ps1`。
+
+多常数合计次数的输出、方程两侧、线程一致性及非法输入回归：
+
+```bash
+python tests/check_constant_count.py --bin build/fates
+```
 
 完整 `77777`、`777777` 方程样例共 22 组回归，覆盖假根过滤、1/4/16 线程，以及关闭实时输出、实时榜单小于/大于最终榜单的情况。测试还使用 Python 标准库的 80 位 Decimal 独立解析并检查每条实时和最终结果，核对真实根的位置，而不只检查残差或屏蔽几个已知方程：
 
@@ -418,7 +455,7 @@ python tests/sweep_search.py --bin build/fates \
 
 Windows 上没有 Developer Prompt 时，可用 `scripts/dev-build.ps1` 直接调用 Visual Studio 自带的 MSVC 与 Ninja 完成配置和构建。
 
-GitHub Actions 使用相同的 CMake/CTest 入口，Linux 任务还会执行完整 `smoke.sh`。性能相关改动的提交要求见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
+GitHub Actions 使用相同的 CMake/CTest 入口，Linux 任务还会执行完整 `smoke.sh`。WebUI 在 Windows、Linux 和 macOS 的 CI 中运行源码单测与 HTTP 搜索检查，Linux/Windows 发布包另外运行独立程序检查（`tests/check_web.py --bin ... --web ...`）。性能相关改动的提交要求见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 ## 限制
 
@@ -458,6 +495,7 @@ Fates/
 ├── frontend/
 │   ├── fates_web.py
 │   ├── build_web.ps1
+│   ├── build_web.sh
 │   ├── requirements-build.txt
 │   └── static/
 ├── scripts/
@@ -472,9 +510,14 @@ Fates/
 └── tests/
     ├── bench_search.py
     ├── benchmark_containers.ps1
+    ├── check_constant_count.py
     ├── check_pgo_workloads.py
+    ├── check_web.py
     ├── diff_equations.py
     ├── smoke.sh
+    ├── test_web.py
+    ├── test_web_commands.cjs
+    ├── test_web_numbers.cjs
     └── sweep_search.py
 ```
 

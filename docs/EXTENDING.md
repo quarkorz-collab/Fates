@@ -6,7 +6,7 @@
 
 按修改范围，可以使用以下入口：
 
-1. 命令行参数：`--constant`、`--symbol-count`、`--symbol-order` 和运算成本覆盖；
+1. 命令行参数：`--constant`、`--symbol-count`、`--constant-count`、`--symbol-order` 和运算成本覆盖；
 2. `configure_user_extensions()`：固定默认值、常数和约束；
 3. `register_user_extensions()`：注册一元运算、二元运算和约束；
 4. 修改核心枚举和求值器：只适用于需要内置运算性能或核心语义的情况。
@@ -22,6 +22,7 @@ template <typename ConfigType>
 inline void configure_user_extensions(ConfigType& cfg) {
     cfg.custom_constants.push_back("G=0.915965594177219:2");
     cfg.symbol_count_specs.push_back("pi=4");
+    cfg.constant_count_specs.push_back("pi,G=2:4");
     cfg.required_symbol_order = {"1", "1", "4", "5", "1", "4"};
     cfg.max_integer = 25;
     cfg.beam = 6000;
@@ -34,7 +35,7 @@ inline void configure_user_extensions(ConfigType& cfg) {
 .\fates.exe TARGET --constant 'G=0.915965594177219:2'
 ```
 
-名称会成为 AST 叶子文本，也可以用于 `--symbol-count G=1`。数值必须有限，成本必须在 `1..65535`。
+名称会成为 AST 叶子文本，也可以用于 `--symbol-count G=1` 或 `--constant-count pi,G=2:4`。后者将所列至少两个常数的叶子次数相加，并在方程模式统计等号两侧。数值必须有限，成本必须在 `1..65535`。
 
 ## 一元运算
 
@@ -124,7 +125,7 @@ extensions.add_constraint(std::move(rule));
 - `satisfied` 决定候选是否能进入最终结果；
 - 没有提供的回调使用默认状态转移。
 
-约束状态也参与数值去重。仅需要限制符号次数或叶子顺序时，优先使用 `--symbol-count` 和 `--symbol-order`。
+约束状态也参与数值去重。仅需要限制符号次数、多个常数的合计次数或叶子顺序时，优先使用 `--symbol-count`、`--constant-count` 和 `--symbol-order`；这些内置约束共用 32 位状态上限，扩展约束另有 32 位。
 
 ## 并发和性能要求
 

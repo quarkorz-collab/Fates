@@ -23,6 +23,29 @@ On Linux or macOS, run the command-line regression suite as well:
 tests/smoke.sh ./build/fates
 ```
 
+WebUI changes must pass the standard-library server tests, command quoting tests,
+and the HTTP smoke test with a native engine (use `build/Release/fates.exe` for
+Visual Studio builds):
+
+```bash
+python -m unittest discover -s tests -p 'test_web*.py'
+node tests/test_web_commands.cjs
+node tests/test_web_numbers.cjs
+node tests/test_web_constant_counts.cjs
+python tests/check_web.py --bin build/fates
+python tests/check_constant_count.py --bin build/fates
+```
+
+On Linux, build the standalone UI with
+`bash frontend/build_web.sh --output build`, then run
+`python tests/check_web.py --bin build/fates --web build/fates-web`.
+On Windows, use `frontend/build_web.ps1 -OutputDirectory "$PWD/build/Release"` and pass
+the corresponding `.exe` paths. The packaged check verifies bundled offline
+assets, discovery from an unrelated working directory, CLI/Web result equality,
+live JSON, cancellation, and POSIX shutdown. Linux release builds use Ubuntu
+22.04 to avoid accidentally raising the glibc baseline; build on each target
+architecture rather than attempting a PyInstaller cross-build.
+
 Windows PGO builds can be reproduced with:
 
 ```powershell

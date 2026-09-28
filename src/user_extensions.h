@@ -61,6 +61,7 @@ inline void configure_user_extensions(ConfigType& cfg) {
 
     // Permanently constrain atom counts or controlled leaf order:
     // cfg.symbol_count_specs.push_back("pi=4");
+    // cfg.constant_count_specs.push_back("pi,e,phi=2:4");
     // cfg.required_symbol_order = {"1", "1", "4", "5", "1", "4"};
 
     // Change private-build defaults without editing the engine:

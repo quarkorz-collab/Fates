@@ -50,6 +50,8 @@ fi
   --equations --mode nearest --results 5 --no-stats | grep -F 'x^2 = 2'
 "$BIN" 2 --digits '' --constants pi --ops '+,/' --max-cost 7 --mode nearest \
   --symbol-count pi=4 --no-stats | grep -F 'pi/pi+pi/pi'
+"$BIN" 5.859874482048838 --digits '' --constants pi,e --ops '+' --max-cost 3 \
+  --constant-count 'pi,e=2:2' --no-stats | grep -F 'pi+e' >/dev/null
 "$BIN" -1 --digits 12 --max-literal-len 1 --constants none --ops - --max-cost 3 \
   --mode nearest --symbol-order 1,2 --no-stats | grep -F '1-2'
 "$BIN" 1.4142135623730951 --digits 2 --constants none --ops sqrt --max-cost 2 \

@@ -8,6 +8,7 @@ import mimetypes
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -81,38 +82,74 @@ def process_creation_flags() -> int:
     return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
+def configure_external_environment() -> None:
+    # PyInstaller prepends its private libraries on Linux. Child processes (the
+    # separately built engine and the system browser) must use the original
+    # search path, not the Python bundle's libraries. Do this before any threads
+    # start; it changes only this process's environment, not the user's shell.
+    if sys.platform.startswith("linux") and getattr(sys, "frozen", False):
+        original = os.environ.get("LD_LIBRARY_PATH_ORIG")
+        if original is None:
+            os.environ.pop("LD_LIBRARY_PATH", None)
+        else:
+            os.environ["LD_LIBRARY_PATH"] = original
+
+
 def static_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS")) / "frontend_static"
     return Path(__file__).resolve().parent / "static"
 
 
+def fates_names() -> tuple[str, ...]:
+    # In particular, WSL must not accidentally select an adjacent Windows build.
+    return ("fates.exe", "fates") if os.name == "nt" else ("fates",)
+
+
+def check_fates_path(path: Path) -> Path:
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"找不到 Fates 可执行文件：{resolved}")
+    if os.name != "nt" and not os.access(resolved, os.X_OK):
+        raise PermissionError(f"Fates 文件没有执行权限：{resolved}；请使用 chmod +x 为该文件添加执行权限。")
+    return resolved
+
+
 def find_fates(explicit: str | None) -> Path:
-    candidates: list[Path] = []
     if explicit:
-        candidates.append(Path(explicit).expanduser())
+        # An explicit path is authoritative: never silently run another build.
+        return check_fates_path(Path(explicit).expanduser())
+
+    names = fates_names()
+    candidates: list[Path] = []
     if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable).resolve().parent / "fates.exe")
-        candidates.append(Path(sys.executable).resolve().parent / "fates")
+        executable_directory = Path(sys.executable).resolve().parent
     else:
-        project_root = Path(__file__).resolve().parent.parent
-        candidates.extend((project_root / "fates.exe", project_root / "fates"))
-    candidates.extend((Path.cwd() / "fates.exe", Path.cwd() / "fates"))
-    for name in ("fates.exe", "fates"):
+        executable_directory = Path(__file__).resolve().parent.parent
+    candidates.extend(executable_directory / name for name in names)
+    candidates.extend(Path.cwd() / name for name in names)
+    for name in names:
         located = shutil.which(name)
         if located:
             candidates.append(Path(located))
 
     checked: set[Path] = set()
+    permission_error: PermissionError | None = None
     for candidate in candidates:
         resolved = candidate.resolve()
         if resolved in checked:
             continue
         checked.add(resolved)
         if resolved.is_file():
-            return resolved
+            try:
+                return check_fates_path(resolved)
+            except PermissionError as error:
+                permission_error = error
+    if permission_error is not None:
+        raise permission_error
     raise FileNotFoundError(
-        "找不到 fates.exe；请把 fates-web.exe 与 fates.exe 放在同一目录，"
+        f"找不到 {names[0]}；请把 fates-web{'.exe' if os.name == 'nt' else ''} "
+        f"与 {names[0]} 放在同一目录，"
         "或使用 --fates PATH 指定。"
     )
 
@@ -176,6 +213,7 @@ class Job:
         self.stderr = CaptureBuffer(MAX_CAPTURE_CHARS)
         self.cancel_requested = False
         self.process: subprocess.Popen[str] | None = None
+        self.worker: threading.Thread | None = None
         self.lock = threading.RLock()
 
     def append(self, channel: str, text: str) -> None:
@@ -208,6 +246,7 @@ class JobManager:
         self.executable = executable
         self.jobs: dict[str, Job] = {}
         self.lock = threading.RLock()
+        self.closing = False
 
     @staticmethod
     def validate_arguments(value: object) -> list[str]:
@@ -233,6 +272,8 @@ class JobManager:
     def create(self, raw_arguments: object) -> Job:
         arguments = self.validate_arguments(raw_arguments)
         with self.lock:
+            if self.closing:
+                raise RuntimeError("服务器正在停止，不能创建新任务")
             active = sum(job.status in {"queued", "running"} for job in self.jobs.values())
             if active >= MAX_ACTIVE_JOBS:
                 raise RuntimeError(f"同时最多运行 {MAX_ACTIVE_JOBS} 个任务")
@@ -240,7 +281,11 @@ class JobManager:
             job = Job(arguments, command)
             self.jobs[job.id] = job
             self._discard_old_jobs_locked()
-        threading.Thread(target=self._run, args=(job,), daemon=True, name=f"fates-job-{job.id[:8]}").start()
+            job.worker = threading.Thread(
+                target=self._run, args=(job,), daemon=True, name=f"fates-job-{job.id[:8]}"
+            )
+            # Start under the manager lock so shutdown cannot miss a queued job.
+            job.worker.start()
         return job
 
     def get(self, job_id: str) -> Job | None:
@@ -252,20 +297,25 @@ class JobManager:
         if job is None:
             return False
         with job.lock:
-            if job.status not in {"queued", "running"}:
+            if job.status not in {"queued", "running"} or job.cancel_requested:
                 return True
             job.cancel_requested = True
             process = job.process
-        if process is not None and process.poll() is None:
-            process.terminate()
-            threading.Thread(target=self._kill_if_needed, args=(process,), daemon=True).start()
+        if process is not None:
+            self._terminate_process(process)
         return True
 
     def shutdown(self) -> None:
         with self.lock:
-            active_ids = [job.id for job in self.jobs.values() if job.status in {"queued", "running"}]
-        for job_id in active_ids:
-            self.cancel(job_id)
+            self.closing = True
+            jobs = list(self.jobs.values())
+        for job in jobs:
+            self.cancel(job.id)
+        # Wait for termination/escalation before the server exits. Otherwise a
+        # daemon cleanup thread can disappear while a Linux search is still alive.
+        for job in jobs:
+            if job.worker is not None:
+                job.worker.join(timeout=3)
 
     def _discard_old_jobs_locked(self) -> None:
         if len(self.jobs) <= 64:
@@ -295,11 +345,27 @@ class JobManager:
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            process.kill()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
+    @classmethod
+    def _terminate_process(cls, process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                return
+            threading.Thread(target=cls._kill_if_needed, args=(process,), daemon=True).start()
 
     def _run(self, job: Job) -> None:
         try:
             with job.lock:
+                if job.cancel_requested:
+                    job.status = "cancelled"
+                    job.ended_at = time.time()
+                    return
                 job.status = "running"
                 job.started_at = time.time()
             process = subprocess.Popen(
@@ -318,7 +384,7 @@ class JobManager:
                 job.process = process
                 cancel_immediately = job.cancel_requested
             if cancel_immediately:
-                process.terminate()
+                self._terminate_process(process)
 
             stdout_reader = threading.Thread(
                 target=self._read_stream, args=(job, "stdout", process.stdout), daemon=True
@@ -532,14 +598,27 @@ def print_server_banner(url: str, fates_version: str, executable: Path) -> None:
     print(f" {fates_version}")
     print(f" Executable : {executable}")
     print(f" Open       : {url}")
-    print(" Stop       : Ctrl+C\n")
+    print(" Stop       : Ctrl+C\n", flush=True)
+
+
+def open_browser(url: str) -> None:
+    try:
+        if webbrowser.open(url):
+            return
+    except (webbrowser.Error, OSError):
+        pass
+    print(f"未能自动打开浏览器，请手动访问 {url}", file=sys.stderr, flush=True)
+
+
+def stop_on_signal(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fates 本地网页服务器")
     parser.add_argument("--host", default="127.0.0.1", help="仅允许回环地址，默认 127.0.0.1")
     parser.add_argument("--port", type=int, default=0, help="监听端口；0 表示自动选择，默认 0")
-    parser.add_argument("--fates", help="fates.exe 路径；默认查找服务器同目录和项目目录")
+    parser.add_argument("--fates", help="Fates 可执行文件路径；默认查找服务器同目录、项目目录、当前目录和 PATH")
     parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
     parser.add_argument("--verbose", action="store_true", help="显示 HTTP 访问日志")
     arguments = parser.parse_args()
@@ -552,6 +631,7 @@ def parse_arguments() -> argparse.Namespace:
 
 def main() -> int:
     configure_utf8_console()
+    configure_external_environment()
     arguments = parse_arguments()
     try:
         executable = find_fates(arguments.fates)
@@ -560,7 +640,7 @@ def main() -> int:
         root = static_root()
         if not (root / "index.html").is_file():
             raise FileNotFoundError(f"前端静态资源缺失：{root}")
-    except (FileNotFoundError, RuntimeError, subprocess.SubprocessError) as error:
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"fates-web 错误：{error}", file=sys.stderr)
         return 2
 
@@ -571,6 +651,8 @@ def main() -> int:
         "fates_path": str(executable),
         "max_active_jobs": MAX_ACTIVE_JOBS,
         "symbols": symbol_catalog,
+        "platform": sys.platform,
+        "command_shell": "powershell" if os.name == "nt" else "posix",
     }
     handler = handler_factory(manager, root, metadata, arguments.verbose)
     try:
@@ -586,14 +668,21 @@ def main() -> int:
     url = f"http://{browser_host}:{port}/"
     metadata["port"] = port
     metadata["url"] = url
-    print_server_banner(url, fates_version, executable)
-    if not arguments.no_browser:
-        threading.Timer(0.35, lambda: webbrowser.open(url)).start()
+    previous_sigterm = signal.signal(signal.SIGTERM, stop_on_signal)
+    browser_timer: threading.Timer | None = None
     try:
+        print_server_banner(url, fates_version, executable)
+        if not arguments.no_browser:
+            browser_timer = threading.Timer(0.35, open_browser, args=(url,))
+            browser_timer.daemon = True
+            browser_timer.start()
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         print("\n正在停止 Fates Web Server...")
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        if browser_timer is not None:
+            browser_timer.cancel()
         manager.shutdown()
         server.server_close()
     return 0
