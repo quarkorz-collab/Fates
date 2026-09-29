@@ -286,11 +286,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android build dependencies
-        run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.0.12077973'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager=$(find "$ANDROID_HOME/cmdline-tools" -maxdepth 3 -type f -name sdkmanager -print -quit)
+          test -n "$sdkmanager"
+          "$sdkmanager" --licenses < <(yes) > /dev/null
+          "$sdkmanager" --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.0.12077973'
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
