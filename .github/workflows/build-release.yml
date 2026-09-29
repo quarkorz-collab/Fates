@@ -352,5 +352,6 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
           else
             gh release create "$GITHUB_REF_NAME" release-assets/* \
-              --generate-notes --title "Fates $GITHUB_REF_NAME"
+              --generate-notes --title "Fates $GITHUB_REF_NAME" \
+              --notes "Android APK: ARM64 only, debug-signed with a new key on each CI build. Uninstall an older build before installing (local app data will be removed)."
           fi
