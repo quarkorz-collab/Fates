@@ -382,6 +382,10 @@ Windows 脚本将 `fates-web.exe` 写入项目根目录，运行时把它放在 
 
 程序还支持 `--max-literal-len`、`--max-integer`、`--digit-cost`、`--constants`、`--constant`、`--symbol-count`、`--constant-count`、`--symbol-order`、`--ops`、`--max-abs`、`--max-exponent`、`--max-trig-arg`、`--max-atoms` 和 `--args-file`。运行 `fates --help` 或 `fates --list-symbols --json` 查看当前二进制的完整目录。
 
+按需启用的特殊函数有 `zeta`（实数 s > 1）、`besselj0` 和 `besselj1`（|x| <= 16）、完全椭圆积分 `ellintk` / `ellinte`（模数 |k| < 1）以及 `erf` / `erfc`。例如 `--ops '+,-,*,/,zeta,besselj0,ellintk'`；这些函数默认不启用，以免显著扩大搜索空间。新增的内置常数包括 `apery`（ζ(3)）、`zeta2`、`zeta4`、`glaisher`、`khinchin`、`omega`、`plastic`、`silver`、`sqrt3`、`sqrt5` 等，在 `--constants` 中按名称启用；默认常数仍为 `pi,e,phi`。WebUI 的符号目录自动读取引擎，显示和复制时使用函数对应的 LaTeX。
+
+对输出公式，`a-(-b)` / `a+(-b)` 分别显示为 `a+b` / `a-b`。这只做精确代数等价的显示化简，不改变实际求值或按符号次数计数的搜索树。Android 离线 APK 的源码与构建要求见 [android/README.md](android/README.md)。
+
 ## 实现概览
 
 - 表达式按复杂度分层生成，候选使用紧凑 AST 索引保存，最后一步才渲染文本；

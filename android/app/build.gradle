@@ -1,0 +1,77 @@
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'org.fates.search'
+    compileSdk 35
+    ndkVersion '27.0.12077973'
+
+    defaultConfig {
+        applicationId 'org.fates.search'
+        minSdk 24
+        targetSdk 35
+        versionCode 6
+        versionName '1.0.6'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    sourceSets {
+        main {
+            assets.srcDir layout.buildDirectory.dir('generated/fates/assets')
+            jniLibs.srcDir layout.buildDirectory.dir('generated/fates/jniLibs')
+        }
+    }
+
+    packaging {
+        jniLibs { useLegacyPackaging = true }
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version = '3.12'
+        if (System.getProperty('os.name').toLowerCase().contains('win')) {
+            buildPython('py', '-3.12')
+        } else {
+            buildPython('python3.12')
+        }
+    }
+    sourceSets {
+        getByName('main') {
+            srcDir '../../frontend'
+        }
+    }
+}
+
+def projectRoot = file('../..')
+def nativeDirectory = layout.buildDirectory.dir('generated/fates/jniLibs/arm64-v8a')
+def stageWebAssets = tasks.register('stageWebAssets', Sync) {
+    from new File(projectRoot, 'frontend/static')
+    into layout.buildDirectory.dir('generated/fates/assets/web')
+}
+
+def compileFatesArm64 = tasks.register('compileFatesArm64', Exec) {
+    def host = System.getProperty('os.name').toLowerCase()
+    def hostTag = host.contains('win') ? 'windows-x86_64' :
+        host.contains('mac') ? 'darwin-x86_64' : 'linux-x86_64'
+    def compiler = new File(android.ndkDirectory,
+        "toolchains/llvm/prebuilt/${hostTag}/bin/clang++${host.contains('win') ? '.exe' : ''}")
+    def outputFile = nativeDirectory.map { it.file('libfates.so') }
+    inputs.files(fileTree(new File(projectRoot, 'src')) { include '**/*.cpp', '**/*.h' })
+    inputs.dir new File(projectRoot, 'third_party/pdqsort')
+    outputs.file outputFile
+    doFirst { nativeDirectory.get().asFile.mkdirs() }
+    executable compiler.absolutePath
+    args '--target=aarch64-linux-android24', '-std=c++20', '-O3', '-DNDEBUG',
+        '-fPIE', '-pie', '-pthread', '-static-libstdc++',
+        '-Wl,-z,max-page-size=16384',
+        '-I', new File(projectRoot, 'third_party/pdqsort').absolutePath,
+        new File(projectRoot, 'src/fates.cpp').absolutePath,
+        '-o', outputFile.get().asFile.absolutePath
+}
+
+tasks.named('preBuild') {
+    dependsOn stageWebAssets, compileFatesArm64
+}

@@ -33,7 +33,12 @@
     </div>
   </header>
 
-  <main class="workspace">
+  <nav class="mobile-view-switch" aria-label="手机视图">
+    <button class="active" type="button" data-mobile-view="config" aria-pressed="true">配置</button>
+    <button type="button" data-mobile-view="results" aria-pressed="false">搜索与结果</button>
+  </nav>
+
+  <main class="workspace" data-mobile-view="config">
     <aside class="control-panel">
       <div class="panel-heading">
         <div>

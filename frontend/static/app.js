@@ -22,6 +22,8 @@ const resultTableWrap = document.querySelector("#resultTableWrap");
 const resultTable = document.querySelector("#resultTable");
 const emptyState = document.querySelector("#emptyState");
 const renderModeButtons = [...document.querySelectorAll("[data-render-mode]")];
+const mobileViewButtons = [...document.querySelectorAll(".mobile-view-switch button[data-mobile-view]")];
+const mobileScrollPositions = { config: null, results: null };
 const toast = document.querySelector("#toast");
 
 const terminalStates = new Set(["completed", "failed", "cancelled"]);
@@ -751,6 +753,7 @@ async function startJob() {
     runtime.jobId = payload.id;
     runtime.startedAt = payload.started_at || runtime.startedAt;
     setRunState(payload.status, "已创建本地任务");
+    setMobileView("results");
     if (runtime.cancelRequested) {
       await cancelJob();
       return;
@@ -1103,6 +1106,23 @@ function activateTab(name) {
   if (name === "raw-output") scheduleRawRender();
 }
 
+function setMobileView(view) {
+  if (view !== "config" && view !== "results") return;
+  const workspace = document.querySelector(".workspace");
+  const previousView = workspace.dataset.mobileView;
+  const mobile = window.matchMedia("(max-width: 920px)").matches;
+  if (mobile && previousView !== view) mobileScrollPositions[previousView] = window.scrollY;
+  workspace.dataset.mobileView = view;
+  for (const button of mobileViewButtons) {
+    const active = button.dataset.mobileView === view;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  if (mobile && previousView !== view) {
+    window.scrollTo(0, mobileScrollPositions[view] ?? document.querySelector(".app-header").offsetHeight);
+  }
+}
+
 let toastTimer = null;
 
 function showToast(message, error = false) {
@@ -1114,6 +1134,10 @@ function showToast(message, error = false) {
 }
 
 async function writeClipboard(value) {
+  if (window.FatesAndroid?.copyText) {
+    window.FatesAndroid.copyText(value);
+    return;
+  }
   if (navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(value);
@@ -1248,6 +1272,10 @@ document.querySelectorAll(".tab").forEach((tab) => {
 
 renderModeButtons.forEach((button) => {
   button.addEventListener("click", () => setRenderMode(button.dataset.renderMode));
+});
+
+mobileViewButtons.forEach((button) => {
+  button.addEventListener("click", () => setMobileView(button.dataset.mobileView));
 });
 
 document.querySelectorAll(".option-group").forEach((group) => {

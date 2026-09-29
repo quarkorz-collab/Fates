@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cmath>
+#include <numbers>
 #include <optional>
 #include <vector>
 
 #include "extension_api.h"
+#include "special_math.h"
 
 // This is the stable, user-editable extension surface. It is intentionally a
 // template so the header does not depend on Fates' internal Config definition.
@@ -37,6 +39,85 @@ inline void register_user_extensions(ExtensionRegistry& extensions) {
         return "\\operatorname{sigmoid}\\left(" + std::string(child) + "\\right)";
     };
     extensions.add_unary(std::move(sigmoid));
+
+    // Expensive special functions are opt-in; adding them to the default
+    // alphabet would multiply the number of candidates at every search layer.
+    UnaryOperationExtension zeta;
+    zeta.name = "zeta";
+    zeta.default_cost = 3;
+    zeta.evaluate = [](double value, const ExtensionLimits&) -> std::optional<double> {
+        const auto result = special_math::zeta(value);
+        return result ? std::optional<double>{result->first} : std::nullopt;
+    };
+    zeta.derivative = [](double value, double, double child_derivative) {
+        const auto result = special_math::zeta(value);
+        return result ? result->second * child_derivative : std::numeric_limits<double>::quiet_NaN();
+    };
+    zeta.render_latex = [](std::string_view child) {
+        return "\\zeta\\left(" + std::string(child) + "\\right)";
+    };
+    extensions.add_unary(std::move(zeta));
+
+    for (int order = 0; order <= 1; ++order) {
+        UnaryOperationExtension bessel;
+        bessel.name = "besselj" + std::to_string(order);
+        bessel.default_cost = 3;
+        bessel.evaluate = [order](double value, const ExtensionLimits&) -> std::optional<double> {
+            const auto result = special_math::bessel_j(order, value);
+            return result ? std::optional<double>{result->first} : std::nullopt;
+        };
+        bessel.derivative = [order](double value, double, double child_derivative) {
+            const auto result = special_math::bessel_j(order, value);
+            return result ? result->second * child_derivative
+                          : std::numeric_limits<double>::quiet_NaN();
+        };
+        bessel.render_latex = [order](std::string_view child) {
+            return "J_{" + std::to_string(order) + "}\\left(" + std::string(child) + "\\right)";
+        };
+        extensions.add_unary(std::move(bessel));
+    }
+
+    for (int kind = 1; kind <= 2; ++kind) {
+        UnaryOperationExtension elliptic;
+        elliptic.name = kind == 1 ? "ellintk" : "ellinte";
+        elliptic.default_cost = 3;
+        elliptic.evaluate = [kind](double modulus, const ExtensionLimits&) -> std::optional<double> {
+            const auto values = special_math::elliptic_complete(modulus);
+            if (!values) return std::nullopt;
+            return kind == 1 ? values->first : values->second;
+        };
+        elliptic.derivative = [kind](double modulus, double, double child_derivative) {
+            const auto values = special_math::elliptic_complete(modulus);
+            return values ? special_math::elliptic_derivative(kind, modulus, values->first, values->second)
+                                * child_derivative
+                          : std::numeric_limits<double>::quiet_NaN();
+        };
+        elliptic.render_latex = [kind](std::string_view child) {
+            return std::string(kind == 1 ? "K\\left(" : "E\\left(") +
+                   std::string(child) + "\\right)";
+        };
+        extensions.add_unary(std::move(elliptic));
+    }
+
+    for (bool complement : {false, true}) {
+        UnaryOperationExtension error_function;
+        error_function.name = complement ? "erfc" : "erf";
+        error_function.default_cost = 2;
+        error_function.evaluate = [complement](double value, const ExtensionLimits&) {
+            return std::optional<double>{complement ? std::erfc(value) : std::erf(value)};
+        };
+        error_function.derivative = [complement](double value, double, double child_derivative) {
+            const double slope = 2.0 / std::sqrt(std::numbers::pi_v<double>) *
+                std::exp(-value * value);
+            return (complement ? -slope : slope) * child_derivative;
+        };
+        error_function.render_latex = [complement](std::string_view child) {
+            return std::string(complement ? "\\operatorname{erfc}\\left("
+                                          : "\\operatorname{erf}\\left(") +
+                   std::string(child) + "\\right)";
+        };
+        extensions.add_unary(std::move(error_function));
+    }
 
     // Add another unary or binary operation by filling an extension object:
     // BinaryOperationExtension average;

@@ -11,6 +11,11 @@
 /.profile-*/
 /.cache/
 /artifacts/
+/android/.gradle/
+/android/.idea/
+/android/local.properties
+/android/app/build/
+/android/build/
 /.playwright-mcp/
 /out/
 /.cmake-*/

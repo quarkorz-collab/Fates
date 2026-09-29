@@ -1494,14 +1494,26 @@ static std::pair<std::vector<UnarySpec>, std::vector<BinarySpec>> parse_ops(cons
 
 static const std::map<std::string, double>& builtin_constants() {
     static const std::map<std::string, double> values = {
+        {"apery", 1.2020569031595942854},
         {"catalan", 0.91596559417721901505},
         {"e", std::numbers::e_v<double>},
+        {"feigenbaum", 4.6692016091029906719},
         {"gamma", 0.57721566490153286061},
+        {"glaisher", 1.2824271291006226369},
+        {"khinchin", 2.6854520010653064453},
+        {"ln10", std::numbers::ln10_v<double>},
         {"ln2", std::numbers::ln2_v<double>},
+        {"omega", 0.5671432904097838730},
         {"phi", (1.0 + std::sqrt(5.0)) / 2.0},
         {"pi", std::numbers::pi_v<double>},
+        {"plastic", 1.32471795724474602596},
+        {"silver", 1.0 + std::numbers::sqrt2_v<double>},
         {"sqrt2", std::numbers::sqrt2_v<double>},
+        {"sqrt3", std::numbers::sqrt3_v<double>},
+        {"sqrt5", std::sqrt(5.0)},
         {"tau", 2.0 * std::numbers::pi_v<double>},
+        {"zeta2", std::numbers::pi_v<double> * std::numbers::pi_v<double> / 6.0},
+        {"zeta4", std::pow(std::numbers::pi_v<double>, 4) / 90.0},
     };
     return values;
 }
@@ -7727,8 +7739,18 @@ static Rendered render_node(const std::vector<AtomSpec>& atoms,
     const Rendered right = render_expression_impl(atoms, arena, node.right);
     switch (kind) {
         case BinaryKind::Add:
+            if (unary_node_is(arena[node.right], UnaryKind::Neg)) {
+                const Rendered positive = render_expression_impl(atoms, arena, arena[node.right].left);
+                return {parenthesize(left, left.precedence < 10) + "-" +
+                            parenthesize(positive, positive.precedence <= 10), 10};
+            }
             return {parenthesize(left, left.precedence < 10) + "+" + parenthesize(right, right.precedence < 10), 10};
         case BinaryKind::Sub:
+            if (unary_node_is(arena[node.right], UnaryKind::Neg)) {
+                const Rendered positive = render_expression_impl(atoms, arena, arena[node.right].left);
+                return {parenthesize(left, left.precedence < 10) + "+" +
+                            parenthesize(positive, positive.precedence < 10), 10};
+            }
             return {parenthesize(left, left.precedence < 10) + "-" + parenthesize(right, right.precedence <= 10), 10};
         case BinaryKind::Mul:
             return {parenthesize(left, left.precedence < 20) + "×" + parenthesize(right, right.precedence < 20), 20};
@@ -7778,13 +7800,20 @@ static std::string latex_escape(std::string_view text) {
 }
 
 static std::string render_atom_latex(std::string_view atom) {
+    if (atom == "apery") return "\\zeta(3)";
     if (atom == "pi") return "\\pi";
     if (atom == "phi") return "\\varphi";
     if (atom == "gamma") return "\\gamma";
     if (atom == "catalan") return "G";
     if (atom == "tau") return "\\tau";
+    if (atom == "omega") return "\\Omega";
     if (atom == "ln2") return "\\ln 2";
+    if (atom == "ln10") return "\\ln 10";
     if (atom == "sqrt2") return "\\sqrt{2}";
+    if (atom == "sqrt3") return "\\sqrt{3}";
+    if (atom == "sqrt5") return "\\sqrt{5}";
+    if (atom == "zeta2") return "\\zeta(2)";
+    if (atom == "zeta4") return "\\zeta(4)";
     if (atom == "e" || atom == "x") return std::string(atom);
     const bool numeric = !atom.empty() && std::all_of(atom.begin(), atom.end(), [](const char c) {
         return (c >= '0' && c <= '9') || c == '.';
@@ -7871,15 +7900,15 @@ static RenderedLatex render_node_latex(const std::vector<AtomSpec>& atoms,
             case UnaryKind::Sqrt:
                 return {"\\sqrt{" + child.text + "}", 80};
             case UnaryKind::Cbrt:
-                return {"\\operatorname{cbrt}" + grouped, 80};
+                return {"\\sqrt[3]{" + child.text + "}", 80};
             case UnaryKind::Sqr:
-                return {"\\operatorname{sqr}" + grouped, 80};
+                return {"{" + latex_parenthesize(child, child.precedence <= 30) + "}^{2}", 30};
             case UnaryKind::Cube:
-                return {"\\operatorname{cube}" + grouped, 80};
+                return {"{" + latex_parenthesize(child, child.precedence <= 30) + "}^{3}", 30};
             case UnaryKind::Ln:
                 return {"\\ln" + grouped, 80};
             case UnaryKind::Log10:
-                return {"\\operatorname{log10}" + grouped, 80};
+                return {"\\log_{10}" + grouped, 80};
             case UnaryKind::Exp:
                 return {"e^{" + child.text + "}", 80};
             case UnaryKind::Sin:
@@ -7931,9 +7960,19 @@ static RenderedLatex render_node_latex(const std::vector<AtomSpec>& atoms,
     const RenderedLatex right = render_expression_latex_impl(atoms, arena, node.right);
     switch (kind) {
         case BinaryKind::Add:
+            if (unary_node_is(arena[node.right], UnaryKind::Neg)) {
+                const RenderedLatex positive = render_expression_latex_impl(atoms, arena, arena[node.right].left);
+                return {latex_parenthesize(left, left.precedence < 10) + "-" +
+                            latex_parenthesize(positive, positive.precedence <= 10), 10};
+            }
             return {latex_parenthesize(left, left.precedence < 10) + "+" +
                         latex_parenthesize(right, right.precedence < 10), 10};
         case BinaryKind::Sub:
+            if (unary_node_is(arena[node.right], UnaryKind::Neg)) {
+                const RenderedLatex positive = render_expression_latex_impl(atoms, arena, arena[node.right].left);
+                return {latex_parenthesize(left, left.precedence < 10) + "+" +
+                            latex_parenthesize(positive, positive.precedence < 10), 10};
+            }
             return {latex_parenthesize(left, left.precedence < 10) + "-" +
                         latex_parenthesize(right, right.precedence <= 10), 10};
         case BinaryKind::Pow:
@@ -10965,6 +11004,54 @@ static int run_self_test() {
               "源码扩展一元运算参与统一求值路径");
     }
     {
+        struct Sample { std::string_view name; double argument; double expected; };
+        constexpr std::array samples{
+            Sample{"zeta", 2.0, 1.6449340668482264},
+            Sample{"besselj0", 1.0, 0.7651976865579666},
+            Sample{"besselj1", 1.0, 0.4400505857449335},
+            Sample{"ellintk", 0.5, 1.6857503548125960},
+            Sample{"ellinte", 0.5, 1.4674622093394272},
+            Sample{"erf", 1.0, 0.8427007929497149},
+        };
+        Config cfg;
+        cfg.symbol_constraints = compile_symbol_constraints(cfg, {});
+        cfg.extension_constraints = compile_extension_constraints();
+        std::vector<Node> arena(1);
+        arena[0].tag = NodeTag::Atom;
+        arena[0].atom_index = 0;
+        arena[0].cost = 1;
+        arena[0].nodes = 1;
+        arena[0].depth = 1;
+        arena[0].depends_on_x = true;
+        arena[0].derivative = 1.0;
+        bool correct = true;
+        for (const Sample& sample : samples) {
+            const auto kind = parse_unary_name(std::string(sample.name));
+            if (!kind) { correct = false; continue; }
+            arena[0].value = sample.argument;
+            const auto candidate = apply_unary(cfg, arena,
+                {*kind, static_cast<std::uint16_t>(default_unary_cost(*kind))}, 0,
+                static_cast<std::uint16_t>(1 + default_unary_cost(*kind)));
+            const auto& operation = extension_registry().unary_operations()[*custom_unary_index(*kind)];
+            constexpr double step = 1.0e-5;
+            const auto before = operation.evaluate(sample.argument - step, extension_limits(cfg));
+            const auto after = operation.evaluate(sample.argument + step, extension_limits(cfg));
+            const double numeric_slope = before && after ? (*after - *before) / (2 * step)
+                                                         : std::numeric_limits<double>::quiet_NaN();
+            correct &= candidate && std::abs(candidate->value - sample.expected) < 5.0e-13 &&
+                       std::abs(candidate->derivative - numeric_slope) < 2.0e-7;
+        }
+        const auto zeta_kind = parse_unary_name("zeta");
+        const auto elliptic_kind = parse_unary_name("ellintk");
+        correct &= zeta_kind && elliptic_kind &&
+            !extension_registry().unary_operations()[*custom_unary_index(*zeta_kind)].evaluate(
+                1.0, extension_limits(cfg)) &&
+            !extension_registry().unary_operations()[*custom_unary_index(*elliptic_kind)].evaluate(
+                1.0, extension_limits(cfg)) &&
+            !special_math::bessel_j(0, 17.0);
+        check(correct, "Zeta、贝塞尔、完全椭圆积分与误差函数值、导数和定义域");
+    }
+    {
         std::vector<AtomSpec> atoms{{"pi", std::numbers::pi_v<double>, 1}, {"q", 0.5, 1}};
         std::vector<Node> arena(6);
         for (std::uint32_t index = 0; index < 2; ++index) {
@@ -11003,6 +11090,81 @@ static int run_self_test() {
                   first.find("^{2}") == std::string::npos && text == "pi×pi/q" &&
                   inverse == "\\frac{1}{\\pi}" && exponential == "e^{\\pi}",
               "乘除等价式显式叉乘、直观 LaTeX 且不凭空引入幂");
+    }
+    {
+        std::vector<AtomSpec> atoms{{"x", 0.5, 1}, {"2", 2.0, 1}};
+        std::vector<Node> arena(15);
+        for (std::uint32_t index = 0; index < 2; ++index) {
+            arena[index].tag = NodeTag::Atom;
+            arena[index].atom_index = index;
+        }
+        const auto unary = [&](std::size_t index, UnaryKind kind, ExprId child) {
+            arena[index].tag = NodeTag::Unary;
+            arena[index].op = static_cast<std::uint8_t>(kind);
+            arena[index].left = child;
+        };
+        const auto binary = [&](std::size_t index, BinaryKind kind, ExprId left, ExprId right) {
+            arena[index].tag = NodeTag::Binary;
+            arena[index].op = static_cast<std::uint8_t>(kind);
+            arena[index].left = left;
+            arena[index].right = right;
+        };
+        unary(2, UnaryKind::Sqrt, 0);
+        unary(3, UnaryKind::Inv, 0);
+        unary(4, UnaryKind::Cbrt, 0);
+        unary(5, UnaryKind::Sqr, 0);
+        unary(6, UnaryKind::Cube, 0);
+        unary(7, UnaryKind::Log10, 0);
+        unary(8, UnaryKind::Neg, 0);
+        unary(9, UnaryKind::Sqr, 8);
+        binary(10, BinaryKind::Add, 0, 1);
+        unary(11, UnaryKind::Cube, 10);
+        unary(12, UnaryKind::Sqr, 5);
+        unary(13, UnaryKind::Neg, 5);
+        binary(14, BinaryKind::Pow, 0, 1);
+        const auto latex = [&](ExprId id) { return render_expression_latex_impl(atoms, arena, id).text; };
+        check(latex(2) == "\\sqrt{x}" && latex(3) == "\\frac{1}{x}" &&
+                  latex(4) == "\\sqrt[3]{x}" && latex(5) == "{x}^{2}" &&
+                  latex(6) == "{x}^{3}" && latex(7) == "\\log_{10}\\left(x\\right)" &&
+                  latex(5) == latex(14) && render_expression_impl(atoms, arena, 5).text == "sqr(x)",
+              "根式、倒数、平方、立方和常用对数的 LaTeX 数学符号");
+        check(latex(9) == "{\\left(-x\\right)}^{2}" &&
+                  latex(11) == "{\\left(x+2\\right)}^{3}" &&
+                  latex(12) == "{\\left({x}^{2}\\right)}^{2}" &&
+                  latex(13) == "-{x}^{2}",
+              "平方立方在负数、加法和嵌套表达式中的括号优先级");
+    }
+    {
+        std::vector<AtomSpec> atoms{{"114", 114.0, 1}, {"514", 514.0, 1}};
+        std::vector<Node> arena(9);
+        for (std::uint32_t index = 0; index < 2; ++index) {
+            arena[index].tag = NodeTag::Atom;
+            arena[index].atom_index = index;
+        }
+        const auto unary = [&](std::size_t index, UnaryKind kind, ExprId child) {
+            arena[index].tag = NodeTag::Unary;
+            arena[index].op = static_cast<std::uint8_t>(kind);
+            arena[index].left = child;
+        };
+        const auto binary = [&](std::size_t index, BinaryKind kind, ExprId left, ExprId right) {
+            arena[index].tag = NodeTag::Binary;
+            arena[index].op = static_cast<std::uint8_t>(kind);
+            arena[index].left = left;
+            arena[index].right = right;
+        };
+        unary(2, UnaryKind::Sqrt, 0);
+        unary(3, UnaryKind::Sqrt, 1);
+        unary(4, UnaryKind::Neg, 1);
+        binary(5, BinaryKind::Sub, 2, 4);
+        binary(6, BinaryKind::Div, 0, 3);
+        binary(7, BinaryKind::Sub, 5, 6);
+        binary(8, BinaryKind::Add, 2, 4);
+        check(render_expression_impl(atoms, arena, 7).text == "sqrt(114)+514-114/sqrt(514)" &&
+                  render_expression_latex_impl(atoms, arena, 7).text ==
+                      "\\sqrt{114}+514-\\frac{114}{\\sqrt{514}}" &&
+                  render_expression_impl(atoms, arena, 8).text == "sqrt(114)-514" &&
+                  render_expression_latex_impl(atoms, arena, 8).text == "\\sqrt{114}-514",
+              "减负数与加负数仅在渲染时等价化简，保留真实运算与约束");
     }
     {
         std::vector<AtomSpec> atoms{{"gamma", 0.5772156649015329, 2},

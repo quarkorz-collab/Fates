@@ -189,6 +189,10 @@ def check(engine_source: Path, web_source: Path | None) -> None:
             assert Path(metadata["fates_path"]) == engine, metadata
             assert metadata["command_shell"] == ("powershell" if os.name == "nt" else "posix"), metadata
             assert metadata["symbols"]["constants"], metadata
+            operator_names = {item["name"] for item in metadata["symbols"]["unary_operators"]}
+            assert {"zeta", "besselj0", "besselj1", "ellintk", "ellinte"} <= operator_names
+            constant_names = {item["name"] for item in metadata["symbols"]["constants"]}
+            assert {"apery", "glaisher", "khinchin", "zeta2"} <= constant_names
 
             for asset in ("index.html", "app.js", "styles.css", "favicon.svg", "vendor/katex/katex.min.js",
                           "vendor/katex/katex.min.css", "vendor/katex/fonts/KaTeX_Main-Regular.woff2"):
@@ -214,6 +218,11 @@ def check(engine_source: Path, web_source: Path | None) -> None:
                     "--max-cost", "3", "--constant-count", "pi,e=2:2", "--threads", "1",
                     "--no-stop", "--json", "--live", "--live-json",
                 ]),
+                ("special functions", "constants", [
+                    "1.6449340668482264", "--digits", "2", "--constants", "none",
+                    "--ops", "zeta", "--max-cost", "4", "--results", "3", "--threads", "1",
+                    "--no-stop", "--json", "--live", "--live-json",
+                ]),
             ):
                 reference = subprocess.run(
                     [str(engine), *arguments], cwd=package, capture_output=True,
@@ -231,6 +240,9 @@ def check(engine_source: Path, web_source: Path | None) -> None:
                     assert any(row["expression"] == "pi+e" for row in actual["results"]), actual
                     assert all(len(re.findall(r"pi|e", row["expression"])) == 2
                                for row in actual["results"]), actual
+                if label == "special functions":
+                    assert any(row["expression"] == "zeta(2)" and
+                               row["latex"] == r"\zeta\left(2\right)" for row in actual["results"]), actual
                 events = [json.loads(line[len(LIVE_PREFIX):]) for line in result["stderr"].splitlines()
                           if line.startswith(LIVE_PREFIX)]
                 assert events, result["stderr"]

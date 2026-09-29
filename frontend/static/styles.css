@@ -220,6 +220,10 @@ pre {
   padding: 24px clamp(16px, 2.4vw, 40px) 40px;
 }
 
+.mobile-view-switch {
+  display: none;
+}
+
 .workspace > * {
   min-width: 0;
 }
@@ -1374,6 +1378,39 @@ footer {
 
   .workspace {
     grid-template-columns: 1fr;
+  }
+
+  .mobile-view-switch {
+    position: sticky;
+    z-index: 20;
+    top: 0;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px;
+    width: 100%;
+    padding: 8px 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .mobile-view-switch button {
+    min-height: 42px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--muted);
+    background: transparent;
+    font-weight: 700;
+  }
+
+  .mobile-view-switch button.active {
+    border-color: var(--line);
+    color: var(--acid);
+    background: rgba(216, 255, 101, 0.08);
+  }
+
+  .workspace[data-mobile-view="config"] .result-panel,
+  .workspace[data-mobile-view="results"] .control-panel {
+    display: none;
   }
 
   .control-panel {
