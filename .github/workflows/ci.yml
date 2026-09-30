@@ -63,6 +63,7 @@ jobs:
           node tests/test_web_numbers.cjs
           node tests/test_web_constant_counts.cjs
           node tests/test_web_mobile_scroll.cjs
+          node tests/test_web_completion.cjs
 
       - name: Run WebUI and constant count smoke tests
         shell: bash
@@ -74,6 +75,7 @@ jobs:
           fi
           python tests/check_web.py --bin "$binary"
           python tests/check_constant_count.py --bin "$binary"
+          python tests/check_completion_policy.py --bin "$binary"
 
       - name: Run command-line regression suite
         if: runner.os == 'Linux'

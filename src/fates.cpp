@@ -419,6 +419,26 @@ struct Candidate {
 static_assert(sizeof(Node) <= 64, "Node error bound must not grow the layout past one cache line");
 static_assert(sizeof(Candidate) <= 64, "Candidate error bound must not grow the layout past one cache line");
 
+static Node node_from_candidate(const Candidate& candidate, bool eligible = true) {
+    Node node;
+    node.value = candidate.value;
+    node.derivative = candidate.derivative;
+    node.error = candidate.error;
+    node.hash = candidate.hash;
+    node.constraint_state = candidate.constraint_state;
+    node.left = candidate.left;
+    node.right = candidate.right;
+    node.atom_index = candidate.atom_index;
+    node.cost = candidate.cost;
+    node.nodes = candidate.nodes;
+    node.depth = candidate.depth;
+    node.tag = candidate.tag;
+    node.op = candidate.op;
+    node.depends_on_x = candidate.depends_on_x;
+    node.eligible = eligible;
+    return node;
+}
+
 // Share of a bounded archive spent on the candidates closest to the target;
 // the remainder is spread over the value axis.  Archives that hold finished
 // expressions are the search output, so they stay biased towards the target.
@@ -444,6 +464,16 @@ struct ErrorRange {
         return above && below;
     }
 };
+
+enum class CompletionMode { Off, Auto, Full };
+
+static std::string_view completion_mode_name(CompletionMode mode) {
+    switch (mode) {
+        case CompletionMode::Off: return "off";
+        case CompletionMode::Full: return "full";
+        default: return "auto";
+    }
+}
 
 struct Config {
     double target = std::numeric_limits<double>::quiet_NaN();
@@ -480,6 +510,8 @@ struct Config {
     unsigned inverse_depth = 0;
     std::size_t inverse_beam = 64;
     std::uint64_t inverse_budget = 1'000'000;
+    CompletionMode completion_mode = CompletionMode::Auto;
+    std::uint64_t completion_budget = 0;
     double max_abs = 1.0e100;
     double max_exponent = 32.0;
     double max_trig_arg = 1.0e6;
@@ -3492,6 +3524,16 @@ struct SearchStats {
     std::size_t mcts_expansions{};
     std::size_t mcts_candidates{};
     std::size_t inverse_candidates{};
+    std::uint64_t inverse_requests_scored{};
+    std::uint64_t completion_work{};
+    std::uint64_t completion_limit{};
+    std::uint64_t completion_queries{};
+    std::uint64_t completion_scanned{};
+    std::uint64_t completion_evaluated{};
+    std::uint64_t completion_candidates{};
+    std::uint64_t completion_improvements{};
+    std::size_t completion_limited_tasks{};
+    std::size_t completion_index_entries{};
     double deterministic_seconds{};
     double mitm_seconds{};
     double inverse_seconds{};
@@ -3501,6 +3543,20 @@ struct SearchStats {
     double mcts_seconds{};
     double genetic_seconds{};
     double equation_seconds{};
+};
+
+// A recursive branch can spend only its lease; unused work remains available
+// to later siblings. Leases compose without increasing the caller's budget.
+struct SearchBudgetSlice {
+    std::uint64_t& parent;
+    const std::uint64_t allowance;
+    std::uint64_t remaining;
+
+    SearchBudgetSlice(std::uint64_t& budget, std::uint64_t requested)
+        : parent(budget), allowance(std::min(budget, requested)), remaining(allowance) {}
+    ~SearchBudgetSlice() { parent -= allowance - remaining; }
+    SearchBudgetSlice(const SearchBudgetSlice&) = delete;
+    SearchBudgetSlice& operator=(const SearchBudgetSlice&) = delete;
 };
 
 struct EquationMatch {
@@ -3792,6 +3848,8 @@ public:
                       << "  \"beam\": " << cfg_.beam << ",\n"
                       << "  \"pairs\": " << cfg_.pair_budget << ",\n"
                       << "  \"deep_frontier\": " << cfg_.deep_frontier << ",\n"
+                      << "  \"completion_mode\": \"" << completion_mode_name(cfg_.completion_mode) << "\",\n"
+                      << "  \"completion_budget\": " << cfg_.completion_budget << ",\n"
                       << "  \"threads\": " << cfg_.threads << ",\n"
                       << "  \"value_bits\": " << cfg_.value_bits << ",\n"
                       << "  \"near_fraction\": " << cfg_.side_near_fraction << ",\n"
@@ -3854,6 +3912,8 @@ public:
                   << "  Explore pairs     : " << cfg_.explore_pairs << " / outer candidate\n"
                   << "  Deep frontier     : " << cfg_.deep_frontier
                   << (cfg_.deep_frontier == 0 ? " (unlimited)\n" : " / cost layer\n")
+                  << "  Completion        : " << completion_mode_name(cfg_.completion_mode)
+                  << " / budget " << cfg_.completion_budget << " (0 = automatic)\n"
                   << "  Atoms / operators : " << atoms_.size() << " / "
                   << (unary_ops_.size() + binary_ops_.size()) << '\n'
                   << "  Digits            : '" << cfg_.digits << "'\n"
@@ -4185,24 +4245,8 @@ private:
 
     ExprId append_candidate_node(const Candidate& candidate, bool eligible = true) {
         if (arena_.size() >= kNoExpr) throw std::runtime_error("表达式数量超过 32 位索引上限");
-        Node node;
-        node.value = candidate.value;
-        node.derivative = candidate.derivative;
-        node.error = candidate.error;
-        node.cost = candidate.cost;
-        node.nodes = candidate.nodes;
-        node.depth = candidate.depth;
-        node.hash = candidate.hash;
-        node.tag = candidate.tag;
-        node.op = candidate.op;
-        node.left = candidate.left;
-        node.right = candidate.right;
-        node.atom_index = candidate.atom_index;
-        node.constraint_state = candidate.constraint_state;
-        node.depends_on_x = candidate.depends_on_x;
-        node.eligible = eligible;
         const ExprId id = static_cast<ExprId>(arena_.size());
-        arena_.push_back(node);
+        arena_.push_back(node_from_candidate(candidate, eligible));
         return id;
     }
 
@@ -4231,23 +4275,8 @@ private:
                             FastMap<std::uint64_t, ExprId>& auxiliary_ids) {
         if (const auto it = auxiliary_ids.find(candidate.hash); it != auxiliary_ids.end()) return it->second;
         if (arena_.size() >= kNoExpr) throw std::runtime_error("表达式数量超过 32 位索引上限");
-        Node node;
-        node.value = candidate.value;
-        node.derivative = candidate.derivative;
-        node.cost = candidate.cost;
-        node.nodes = candidate.nodes;
-        node.depth = candidate.depth;
-        node.hash = candidate.hash;
-        node.tag = candidate.tag;
-        node.op = candidate.op;
-        node.left = candidate.left;
-        node.right = candidate.right;
-        node.atom_index = candidate.atom_index;
-        node.constraint_state = candidate.constraint_state;
-        node.depends_on_x = candidate.depends_on_x;
-        node.eligible = false;
         const ExprId id = static_cast<ExprId>(arena_.size());
-        arena_.push_back(node);
+        arena_.push_back(node_from_candidate(candidate, false));
         auxiliary_ids.emplace(candidate.hash, id);
         return id;
     }
@@ -4605,23 +4634,24 @@ private:
         return best / std::max(1.0, std::abs(desired));
     }
 
-    std::vector<double> desired_hole_values(BinaryKind kind,
-                                            double anchor,
-                                            double desired,
-                                            bool hole_on_left) const {
-        std::vector<double> values;
+    UnaryInverseValues desired_hole_values(BinaryKind kind,
+                                           double anchor,
+                                           double desired,
+                                           bool hole_on_left) const {
+        UnaryInverseValues values;
         const auto primary = hole_on_left ? desired_left(kind, anchor, desired)
                                           : desired_right(kind, anchor, desired);
-        if (primary && std::isfinite(*primary)) values.push_back(*primary);
+        if (primary && std::isfinite(*primary)) values.add(*primary);
         if (hole_on_left && kind == BinaryKind::Pow && desired > 0.0) {
             const double rounded = std::nearbyint(anchor);
             const bool even_integer = std::abs(anchor - rounded) <=
                     1.0e-12 * std::max(1.0, std::abs(anchor)) &&
                 std::fmod(std::abs(rounded), 2.0) == 0.0 && rounded != 0.0;
-            if (even_integer && primary && *primary > 0.0) values.push_back(-*primary);
+            if (even_integer && primary && *primary > 0.0) values.add(-*primary);
         }
-        std::sort(values.begin(), values.end());
-        values.erase(std::unique(values.begin(), values.end()), values.end());
+        if (values.count == 2 && values.values[0] > values.values[1]) {
+            std::swap(values.values[0], values.values[1]);
+        }
         return values;
     }
 
@@ -4651,71 +4681,93 @@ private:
         for (std::size_t index : indices) collector.consider(candidate_from_node(exact_layer[index]));
 
         if (depth > 0 && remaining_budget > 0) {
-            for (const UnarySpec& unary : unary_ops_) {
-                if (unary.cost >= exact_cost) continue;
-                const unsigned child_cost = exact_cost - unary.cost;
-                for (double desired_child : inverse_unary_values(unary.kind, desired)) {
-                    for (const Candidate& child : solve_inverse_value(
-                             desired_child, child_cost, depth - 1, source_layers,
-                             auxiliary_ids, cache, remaining_budget)) {
-                        if (remaining_budget == 0) break;
-                        const ExprId child_id = append_auxiliary(child, auxiliary_ids);
-                        --remaining_budget;
-                        ++stats_.attempted;
-                        ++stats_.by_cost[exact_cost].attempted;
-                        const auto candidate = apply_unary(
-                            cfg_, arena_, unary, child_id, static_cast<std::uint16_t>(exact_cost));
-                        if (!candidate) continue;
-                        ++stats_.valid;
-                        ++stats_.by_cost[exact_cost].valid;
-                        collector.consider(*candidate);
-                    }
-                }
-            }
-
-            for (const BinarySpec& binary : binary_ops_) {
-                if (static_cast<unsigned>(binary.cost) + 2U > exact_cost || remaining_budget == 0) continue;
-                const unsigned remainder = exact_cost - binary.cost;
-                for (unsigned left_cost = 1; left_cost < remainder && remaining_budget > 0; ++left_cost) {
-                    const unsigned right_cost = remainder - left_cost;
-                    if (is_commutative(binary.kind) && left_cost > right_cost) continue;
-                    const auto& left_ids = source_layers[left_cost];
-                    const auto& right_ids = source_layers[right_cost];
-                    if (left_ids.empty() || right_ids.empty()) continue;
-
-                    indices.clear();
-                    for (ExprId left_id : left_ids) {
-                        if (remaining_budget == 0) break;
-                        const auto wanted = desired_right(binary.kind, arena_[left_id].value, desired);
-                        if (!wanted || !std::isfinite(*wanted)) continue;
-                        indices.clear();
-                        add_near_indices(indices, right_ids, arena_, *wanted, 0, cfg_.inverse_neighbors);
-                        if (binary.kind == BinaryKind::Pow) {
-                            static constexpr double useful_exponents[] = {-3.0, -2.0, -1.0, -0.5,
-                                                                          0.5, 2.0, 3.0};
-                            for (double exponent : useful_exponents) {
-                                add_near_indices(indices, right_ids, arena_, exponent, 0,
-                                                 std::min<std::size_t>(3, cfg_.inverse_neighbors));
-                            }
-                            std::sort(indices.begin(), indices.end());
-                            indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
-                        }
-                        for (std::size_t index : indices) {
-                            if (remaining_budget == 0) break;
-                            --remaining_budget;
+            // Reserve siblings at the root request. Descendants already have a
+            // bounded lease; splitting every tiny lease again spends most time
+            // on setup rather than useful candidate evaluations.
+            const bool fair_root = cfg_.completion_mode == CompletionMode::Full && depth == cfg_.inverse_depth;
+            {
+                SearchBudgetSlice unary_phase(remaining_budget,
+                    !fair_root || binary_ops_.empty() ? remaining_budget : remaining_budget / 2);
+                for (std::size_t unary_index = 0; unary_index < unary_ops_.size(); ++unary_index) {
+                    const UnarySpec& unary = unary_ops_[unary_index];
+                    if (unary.cost >= exact_cost) continue;
+                    SearchBudgetSlice branch(unary_phase.remaining,
+                        fair_root ? unary_phase.remaining / (unary_ops_.size() - unary_index)
+                                  : unary_phase.remaining);
+                    const unsigned child_cost = exact_cost - unary.cost;
+                    for (double desired_child : inverse_unary_values(unary.kind, desired)) {
+                        for (const Candidate& child : solve_inverse_value(
+                                 desired_child, child_cost, depth - 1, source_layers,
+                                 auxiliary_ids, cache, branch.remaining)) {
+                            if (branch.remaining == 0) break;
+                            const ExprId child_id = append_auxiliary(child, auxiliary_ids);
+                            --branch.remaining;
                             ++stats_.attempted;
                             ++stats_.by_cost[exact_cost].attempted;
-                            const auto candidate = apply_binary(
-                                cfg_, arena_, binary, left_id, right_ids[index],
-                                static_cast<std::uint16_t>(exact_cost));
+                            const auto candidate = apply_unary(
+                                cfg_, arena_, unary, child_id, static_cast<std::uint16_t>(exact_cost));
                             if (!candidate) continue;
                             ++stats_.valid;
                             ++stats_.by_cost[exact_cost].valid;
                             collector.consider(*candidate);
                         }
                     }
+                }
+            }
 
-                    if (depth <= 1 || remaining_budget == 0) continue;
+            for (std::size_t binary_index = 0; binary_index < binary_ops_.size(); ++binary_index) {
+                const BinarySpec& binary = binary_ops_[binary_index];
+                if (static_cast<unsigned>(binary.cost) + 2U > exact_cost || remaining_budget == 0) continue;
+                SearchBudgetSlice operation(remaining_budget,
+                    fair_root ? remaining_budget / (binary_ops_.size() - binary_index) : remaining_budget);
+                const unsigned remainder = exact_cost - binary.cost;
+                const unsigned last_left = is_commutative(binary.kind) ? remainder / 2 : remainder - 1;
+                for (unsigned left_cost = 1; left_cost <= last_left && operation.remaining > 0; ++left_cost) {
+                    const unsigned right_cost = remainder - left_cost;
+                    if (is_commutative(binary.kind) && left_cost > right_cost) continue;
+                    const auto& left_ids = source_layers[left_cost];
+                    const auto& right_ids = source_layers[right_cost];
+                    if (left_ids.empty() || right_ids.empty()) continue;
+                    SearchBudgetSlice partition(operation.remaining,
+                        fair_root ? operation.remaining / (last_left - left_cost + 1) : operation.remaining);
+
+                    {
+                        SearchBudgetSlice direct(partition.remaining,
+                            fair_root && depth > 1 ? partition.remaining / 2 : partition.remaining);
+                        indices.clear();
+                        for (ExprId left_id : left_ids) {
+                            if (direct.remaining == 0) break;
+                            const auto wanted = desired_right(binary.kind, arena_[left_id].value, desired);
+                            if (!wanted || !std::isfinite(*wanted)) continue;
+                            indices.clear();
+                            add_near_indices(indices, right_ids, arena_, *wanted, 0, cfg_.inverse_neighbors);
+                            if (binary.kind == BinaryKind::Pow) {
+                                static constexpr double useful_exponents[] = {-3.0, -2.0, -1.0, -0.5,
+                                                                              0.5, 2.0, 3.0};
+                                for (double exponent : useful_exponents) {
+                                    add_near_indices(indices, right_ids, arena_, exponent, 0,
+                                                     std::min<std::size_t>(3, cfg_.inverse_neighbors));
+                                }
+                                std::sort(indices.begin(), indices.end());
+                                indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+                            }
+                            for (std::size_t index : indices) {
+                                if (direct.remaining == 0) break;
+                                --direct.remaining;
+                                ++stats_.attempted;
+                                ++stats_.by_cost[exact_cost].attempted;
+                                const auto candidate = apply_binary(
+                                    cfg_, arena_, binary, left_id, right_ids[index],
+                                    static_cast<std::uint16_t>(exact_cost));
+                                if (!candidate) continue;
+                                ++stats_.valid;
+                                ++stats_.by_cost[exact_cost].valid;
+                                collector.consider(*candidate);
+                            }
+                        }
+                    }
+
+                    if (depth <= 1 || partition.remaining == 0) continue;
                     struct Request {
                         ExprId anchor{kNoExpr};
                         bool hole_on_left{};
@@ -4733,32 +4785,46 @@ private:
                         for (ExprId anchor_id : anchors) {
                             for (double wanted : desired_hole_values(
                                      binary.kind, arena_[anchor_id].value, desired, hole_on_left)) {
+                                ++stats_.inverse_requests_scored;
                                 group.push_back({anchor_id, hole_on_left, wanted,
                                                  nearest_value_score(hole_layer, wanted)});
                             }
                         }
-                        std::sort(group.begin(), group.end(), [&](const Request& a, const Request& b) {
+                        const auto less = [&](const Request& a, const Request& b) {
                             if (a.score != b.score) return a.score < b.score;
                             const Node& na = arena_[a.anchor];
                             const Node& nb = arena_[b.anchor];
                             if (na.nodes != nb.nodes) return na.nodes < nb.nodes;
                             if (na.depth != nb.depth) return na.depth < nb.depth;
                             return na.hash < nb.hash;
-                        });
+                        };
+                        // Only a handful of requests survive. Preserve the old
+                        // full-sort tie behavior for the two signed power roots.
+                        if (hole_on_left && binary.kind == BinaryKind::Pow) {
+                            std::sort(group.begin(), group.end(), less);
+                        } else {
+                            std::partial_sort(group.begin(),
+                                group.begin() + static_cast<std::ptrdiff_t>(std::min(request_cap, group.size())),
+                                group.end(), less);
+                        }
                         if (group.size() > request_cap) group.resize(request_cap);
                         requests.insert(requests.end(), group.begin(), group.end());
                     };
                     collect_requests(left_ids, right_ids, false);
                     if (!is_commutative(binary.kind)) collect_requests(right_ids, left_ids, true);
 
-                    for (const Request& request : requests) {
+                    for (std::size_t request_index = 0; request_index < requests.size(); ++request_index) {
+                        const Request& request = requests[request_index];
+                        SearchBudgetSlice request_budget(partition.remaining,
+                            fair_root ? partition.remaining / (requests.size() - request_index)
+                                      : partition.remaining);
                         const unsigned hole_cost = request.hole_on_left ? left_cost : right_cost;
                         for (const Candidate& hole : solve_inverse_value(
                                  request.desired_hole, hole_cost, depth - 1, source_layers,
-                                 auxiliary_ids, cache, remaining_budget)) {
-                            if (remaining_budget == 0) break;
+                                 auxiliary_ids, cache, request_budget.remaining)) {
+                            if (request_budget.remaining == 0) break;
                             const ExprId hole_id = append_auxiliary(hole, auxiliary_ids);
-                            --remaining_budget;
+                            --request_budget.remaining;
                             ++stats_.attempted;
                             ++stats_.by_cost[exact_cost].attempted;
                             const auto candidate = request.hole_on_left
@@ -5610,6 +5676,247 @@ private:
         return selected;
     }
 
+    struct CompletionProgress {
+        unsigned hit_cost{};
+        double best_error{std::numeric_limits<double>::infinity()};
+    };
+
+    struct CompletionPartner {
+        double value{};
+        ExprId id{kNoExpr};
+        unsigned cost{};
+    };
+
+    bool reliable_completion_hit(double value, double error) const {
+        const double tolerance = std::min(cfg_.epsilon,
+            32.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::abs(cfg_.target)));
+        return std::isfinite(error) && error >= 0.0 &&
+            std::abs(value - cfg_.target) + error <= tolerance;
+    }
+
+    CompletionProgress initial_completion_progress(unsigned minimum_cost) const {
+        CompletionProgress progress{cfg_.max_cost + 1};
+        for (const Node& node : arena_) {
+            if (!node.eligible || !cfg_.error_range.contains(node.value - cfg_.target) ||
+                !constraint_satisfied(cfg_, node.constraint_state)) continue;
+            progress.best_error = std::min(progress.best_error, std::abs(node.value - cfg_.target));
+            if (reliable_completion_hit(node.value, node.error)) {
+                progress.hit_cost = std::min(progress.hit_cost, static_cast<unsigned>(node.cost));
+                if (progress.hit_cost <= minimum_cost && cfg_.mode == "nearest") break;
+            }
+        }
+        return progress;
+    }
+
+    void record_completion(const Candidate& candidate, CompletionProgress& progress) {
+        ++stats_.completion_candidates;
+        if (!cfg_.error_range.contains(candidate.value - cfg_.target)) return;
+        const double error = std::abs(candidate.value - cfg_.target);
+        bool improved = error < progress.best_error;
+        progress.best_error = std::min(progress.best_error, error);
+        if (candidate.cost < progress.hit_cost && reliable_completion_hit(candidate.value, candidate.error)) {
+            progress.hit_cost = candidate.cost;
+            improved = true;
+        }
+        if (improved) ++stats_.completion_improvements;
+    }
+
+    // One immutable, value-sorted index spans all partner costs. Keep the real
+    // cost and ExprId: a nearby value never bypasses cost or symbol constraints.
+    std::vector<CompletionPartner> make_completion_index(
+        const std::vector<std::vector<ExprId>>& layers, unsigned side_cost,
+        std::uint64_t& budget) {
+        std::size_t count = 0;
+        for (unsigned cost = 1; cost <= side_cost; ++cost) count += layers[cost].size();
+        if (count > budget) {
+            ++stats_.completion_limited_tasks;
+            return {};
+        }
+        budget -= count;
+        stats_.completion_work += count;
+        std::vector<CompletionPartner> index;
+        index.reserve(count);
+        for (unsigned cost = 1; cost <= side_cost; ++cost) {
+            for (ExprId id : layers[cost]) index.push_back({arena_[id].value, id, arena_[id].cost});
+        }
+        std::sort(index.begin(), index.end(), [](const CompletionPartner& a, const CompletionPartner& b) {
+            if (a.value != b.value) return a.value < b.value;
+            if (a.cost != b.cost) return a.cost < b.cost;
+            return a.id < b.id;
+        });
+        stats_.completion_index_entries = index.size();
+        return index;
+    }
+
+    void complete_deep_unary_auto(CostArchives& collectors,
+                                  const std::vector<TaskResult>& results,
+                                  const std::vector<CompletionPartner>& index,
+                                  FastMap<std::uint64_t, ExprId>& auxiliary_ids,
+                                  CompletionProgress& progress,
+                                  std::uint64_t& budget) {
+        if (index.empty()) return;
+        bool limited = false;
+        const auto spend = [&] {
+            if (budget == 0) {
+                if (!limited) ++stats_.completion_limited_tasks;
+                limited = true;
+                return false;
+            }
+            --budget;
+            ++stats_.completion_work;
+            return true;
+        };
+        const auto complete = [&](const Candidate& candidate) {
+            if (cfg_.mode == "nearest" && candidate.cost + 2U >= progress.hit_cost) return;
+            if (!spend()) return;
+            ++stats_.completion_scanned;
+            ExprId unary_id = kNoExpr;
+            for (const BinarySpec& binary : binary_ops_) {
+                const unsigned limit = cfg_.mode == "nearest"
+                    ? std::min(cfg_.max_cost + 1, progress.hit_cost) : cfg_.max_cost + 1;
+                if (candidate.cost + binary.cost + 1U >= limit) continue;
+                const unsigned maximum_partner = limit - candidate.cost - binary.cost - 1;
+                const unsigned directions = is_commutative(binary.kind) ? 1U : 2U;
+                for (unsigned direction = 0; direction < directions; ++direction) {
+                    if (!spend()) return;
+                    ++stats_.completion_queries;
+                    const bool unary_on_left = direction == 0;
+                    const auto wanted = unary_on_left
+                        ? desired_right(binary.kind, candidate.value, cfg_.target)
+                        : desired_left(binary.kind, candidate.value, cfg_.target);
+                    if (!wanted || !std::isfinite(*wanted)) continue;
+                    const double desired = *wanted;
+                    if ((desired < index.front().value && !equivalent_value(desired, index.front().value)) ||
+                        (desired > index.back().value && !equivalent_value(desired, index.back().value))) continue;
+                    const auto position = static_cast<std::size_t>(std::lower_bound(index.begin(), index.end(), desired,
+                        [](const CompletionPartner& entry, double value) { return entry.value < value; }) - index.begin());
+                    const auto visit = [&](const CompletionPartner& partner) {
+                        if (!spend()) return;
+                        if (partner.cost > maximum_partner) return;
+                        const auto total_cost = static_cast<std::uint16_t>(candidate.cost + binary.cost + partner.cost);
+                        if (cfg_.mode == "nearest" && total_cost >= progress.hit_cost) return;
+                        if (unary_id == kNoExpr) unary_id = append_auxiliary(candidate, auxiliary_ids);
+                        ++stats_.completion_evaluated;
+                        ++stats_.attempted;
+                        ++stats_.by_cost[total_cost].attempted;
+                        const auto completed = unary_on_left
+                            ? apply_binary(cfg_, arena_, binary, unary_id, partner.id, total_cost)
+                            : apply_binary(cfg_, arena_, binary, partner.id, unary_id, total_cost);
+                        if (!completed) return;
+                        ++stats_.valid;
+                        ++stats_.by_cost[total_cost].valid;
+                        if (!equivalent_value(completed->value, cfg_.target) ||
+                            !constraint_satisfied(cfg_, completed->constraint_state)) return;
+                        collectors.at(total_cost).consider(*completed);
+                        record_completion(*completed, progress);
+                    };
+                    // Search both sides of lower_bound. A single global nearest
+                    // neighbor might belong to an ineligible cost/state, so do
+                    // not stop on it. Pathological dense windows are budgeted.
+                    for (std::size_t j = position; j < index.size() && equivalent_value(index[j].value, desired); ++j) {
+                        visit(index[j]);
+                        if (limited) return;
+                    }
+                    for (std::size_t j = position; j > 0 && equivalent_value(index[j - 1].value, desired); --j) {
+                        visit(index[j - 1]);
+                        if (limited) return;
+                    }
+                }
+            }
+        };
+        // Task/chunk order is fixed, independent of worker count. No copying,
+        // candidate sort, or per-cost desired-value array is needed here.
+        for (const TaskResult& result : results) {
+            for (const Candidate& candidate : result.candidates) {
+                complete(candidate);
+                if (limited) return;
+            }
+            for (const Candidate& candidate : result.extra_candidates) {
+                complete(candidate);
+                if (limited) return;
+            }
+        }
+    }
+
+    // A sidecar's f(x) may be useful only as one side of the final expression.
+    // Probe its target-directed partner before the next archive can discard it.
+    // Only near-exact partners are evaluated/materialized; this is a linear
+    // sweep with hinted lookups, not a new Cartesian product or another round.
+    void complete_deep_unary(CostArchives& collectors,
+                             const std::vector<TaskResult>& results,
+                             const std::vector<std::vector<ExprId>>& source_layers,
+                             const std::vector<std::vector<double>>& source_values,
+                             unsigned side_cost,
+                             FastMap<std::uint64_t, ExprId>& auxiliary_ids,
+                             CompletionProgress& progress) {
+        std::vector<Candidate> candidates;
+        for (const auto& result : results) {
+            candidates.insert(candidates.end(), result.candidates.begin(), result.candidates.end());
+            candidates.insert(candidates.end(), result.extra_candidates.begin(), result.extra_candidates.end());
+        }
+        if (candidates.empty()) return;
+        stats_.completion_scanned += candidates.size();
+        stats_.completion_work += candidates.size();
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            if (a.value != b.value) return a.value < b.value;
+            return a.hash < b.hash;
+        });
+        candidates.erase(std::unique(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            return a.hash == b.hash;
+        }), candidates.end());
+        const unsigned unary_cost = candidates.front().cost;
+        std::vector<std::optional<double>> wanted(candidates.size());
+        for (const auto& binary : binary_ops_) {
+            if (unary_cost + binary.cost >= cfg_.max_cost) continue;
+            const unsigned maximum_partner = std::min(side_cost, cfg_.max_cost - unary_cost - binary.cost);
+            const unsigned directions = is_commutative(binary.kind) ? 1U : 2U;
+            for (unsigned direction = 0; direction < directions; ++direction) {
+                const bool unary_on_left = direction == 0;
+                for (std::size_t i = 0; i < candidates.size(); ++i) {
+                    wanted[i] = unary_on_left
+                        ? desired_right(binary.kind, candidates[i].value, cfg_.target)
+                        : desired_left(binary.kind, candidates[i].value, cfg_.target);
+                }
+                for (unsigned partner_cost = 1; partner_cost <= maximum_partner; ++partner_cost) {
+                    const auto& ids = source_layers[partner_cost];
+                    const auto& values = source_values[partner_cost];
+                    if (ids.empty()) continue;
+                    const auto total_cost = static_cast<std::uint16_t>(unary_cost + binary.cost + partner_cost);
+                    std::size_t hint = 0;
+                    for (std::size_t i = 0; i < candidates.size(); ++i) {
+                        ++stats_.completion_work;
+                        ++stats_.completion_queries;
+                        if (!wanted[i] || !std::isfinite(*wanted[i])) continue;
+                        const double desired = *wanted[i];
+                        hint = lower_bound_hinted(values.data(), values.size(), desired, 0, hint);
+                        if ((hint == values.size() || !equivalent_value(values[hint], desired)) &&
+                            (hint == 0 || !equivalent_value(values[hint - 1], desired))) continue;
+                        const auto window = value_window(values.data(), values.size(), desired, 0,
+                                                         cfg_.inverse_neighbors, hint);
+                        for (std::size_t j = window.begin; j < window.end; ++j) {
+                            if (!equivalent_value(values[j], desired)) continue;
+                            const auto unary_id = append_auxiliary(candidates[i], auxiliary_ids);
+                            ++stats_.completion_work;
+                            ++stats_.completion_evaluated;
+                            ++stats_.attempted;
+                            ++stats_.by_cost[total_cost].attempted;
+                            const auto completed = unary_on_left
+                                ? apply_binary(cfg_, arena_, binary, unary_id, ids[j], total_cost)
+                                : apply_binary(cfg_, arena_, binary, ids[j], unary_id, total_cost);
+                            if (!completed) continue;
+                            ++stats_.valid;
+                            ++stats_.by_cost[total_cost].valid;
+                            if (!equivalent_value(completed->value, cfg_.target) ||
+                                !constraint_satisfied(cfg_, completed->constraint_state)) continue;
+                            collectors.at(total_cost).consider(*completed);
+                            record_completion(*completed, progress);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     void run_deep_compositions(LiveTopReporter& live_reporter, unsigned side_cost) {
         stats_.used_deep_compositions = true;
         const std::size_t deep_cap = cfg_.deep_beam == 0
@@ -5617,6 +5924,40 @@ private:
             : cfg_.deep_beam;
 
         auto all_layers = extended_layers_snapshot();
+        // Stable, read-only side libraries: later rounds append to all_layers.
+        std::vector<std::vector<ExprId>> completion_layers(side_cost + 1);
+        std::vector<std::vector<double>> completion_values(side_cost + 1);
+        FastMap<std::uint64_t, ExprId> completion_auxiliary;
+        CompletionProgress completion_progress{cfg_.max_cost + 1};
+        std::vector<CompletionPartner> completion_index;
+        std::uint64_t completion_remaining = 0;
+        const bool completion_enabled = cfg_.pareto_slots > 1 &&
+            cfg_.completion_mode != CompletionMode::Off && !unary_ops_.empty() && !binary_ops_.empty();
+        unsigned minimum_completion_cost = 0;
+        if (completion_enabled) {
+            unsigned unary_min = unary_ops_.front().cost;
+            unsigned binary_min = binary_ops_.front().cost;
+            for (const auto& op : unary_ops_) unary_min = std::min(unary_min, static_cast<unsigned>(op.cost));
+            for (const auto& op : binary_ops_) binary_min = std::min(binary_min, static_cast<unsigned>(op.cost));
+            minimum_completion_cost = unary_min + binary_min + 2;
+            completion_progress = initial_completion_progress(minimum_completion_cost);
+        }
+        if (completion_enabled && cfg_.completion_mode == CompletionMode::Auto) {
+            completion_remaining = cfg_.completion_budget != 0 ? cfg_.completion_budget :
+                std::max<std::uint64_t>(8'000'000, std::min<std::uint64_t>(cfg_.beam, 62'500) * 1024);
+            stats_.completion_limit = completion_remaining;
+            if (cfg_.mode != "nearest" || completion_progress.hit_cost > minimum_completion_cost) {
+                completion_index = make_completion_index(all_layers, side_cost, completion_remaining);
+            }
+        }
+        if (completion_enabled && cfg_.completion_mode == CompletionMode::Full) {
+            for (unsigned cost = 1; cost <= side_cost; ++cost) {
+                completion_layers[cost] = all_layers[cost];
+                auto& values = completion_values[cost];
+                values.reserve(completion_layers[cost].size());
+                for (ExprId id : completion_layers[cost]) values.push_back(arena_[id].value);
+            }
+        }
         std::vector<std::vector<ExprId>> frontier(layers_.size());
         std::vector<std::vector<ExprId>> bounded_all_layers(layers_.size());
         FastSet<std::uint64_t> archive_hashes;
@@ -5639,6 +5980,19 @@ private:
             CostArchives collectors(cfg_.max_cost, cfg_.target, state_value_bits(cfg_), deep_cap,
                                     cfg_.pareto_slots, pareto_extra_cap(), kDefaultNearFraction);
 
+            std::size_t completion_tasks = 0;
+            if (!completion_index.empty()) {
+                for (const auto& op : unary_ops_) {
+                    for (unsigned cost = 1; cost < frontier.size(); ++cost) {
+                        const unsigned total = cost + op.cost;
+                        if (total + 2 > cfg_.max_cost) continue;
+                        const auto& ids = round == 0 && cost <= side_cost && total > side_cost
+                            ? bounded_all_layers[cost] : frontier[cost];
+                        if (!ids.empty()) ++completion_tasks;
+                    }
+                }
+            }
+
             for (std::size_t op_index = 0; op_index < unary_ops_.size(); ++op_index) {
                 const UnarySpec& op = unary_ops_[op_index];
                 for (unsigned child_cost = 1; child_cost < frontier.size(); ++child_cost) {
@@ -5650,9 +6004,10 @@ private:
                     }
                     const auto& ids = *ids_ptr;
                     if (ids.empty()) continue;
+                    // Local archives prune before merging. Their boundaries
+                    // must not change with executor width (also for completion).
                     const std::size_t chunks = std::min<std::size_t>(
-                        ids.size(), std::max<std::size_t>(1, std::min<std::size_t>(
-                            cfg_.task_chunks, static_cast<std::size_t>(cfg_.threads) * 2)));
+                        ids.size(), std::max<std::size_t>(1, cfg_.task_chunks));
                     const std::size_t chunk_size = (ids.size() + chunks - 1) / chunks;
                     std::vector<TaskResult> results(chunks);
                     executor_.run(chunks, [&](std::size_t chunk) {
@@ -5678,6 +6033,16 @@ private:
                         result.extra_candidates = local.take_extras(pareto_extra_cap());
                         result.shard_extras(state_value_bits(cfg_), false);
                     });
+                    if (completion_enabled && cfg_.completion_mode == CompletionMode::Full) {
+                        complete_deep_unary(collectors, results, completion_layers, completion_values,
+                                            side_cost, completion_auxiliary, completion_progress);
+                    } else if (!completion_index.empty() && total_cost + 2 <= cfg_.max_cost) {
+                        SearchBudgetSlice slice(completion_remaining,
+                            completion_remaining / std::max<std::size_t>(1, completion_tasks));
+                        if (completion_tasks > 0) --completion_tasks;
+                        complete_deep_unary_auto(collectors, results, completion_index,
+                            completion_auxiliary, completion_progress, slice.remaining);
+                    }
                     merge_deep_results(collectors, total_cost, results);
                 }
             }
@@ -5701,8 +6066,7 @@ private:
                                                        const std::vector<ExprId>& inner_ids,
                                                        bool outer_on_left) {
                             const std::size_t chunks = std::min<std::size_t>(
-                                outer_ids.size(), std::max<std::size_t>(1, std::min<std::size_t>(
-                                    cfg_.task_chunks, static_cast<std::size_t>(cfg_.threads) * 2)));
+                                outer_ids.size(), std::max<std::size_t>(1, cfg_.task_chunks));
                             const std::size_t chunk_size = (outer_ids.size() + chunks - 1) / chunks;
                             std::vector<TaskResult> results(chunks);
                             executor_.run(chunks, [&](std::size_t chunk) {
@@ -9048,6 +9412,19 @@ static void print_stats(const SearchRun& run) {
     std::cerr << " time=" << std::fixed << std::setprecision(3) << run.stats.seconds << "s\n";
 }
 
+static void print_completion_json_fields(const SearchStats& stats) {
+    std::cout << ", \"inverse_requests_scored\": " << stats.inverse_requests_scored
+              << ", \"completion_work\": " << stats.completion_work
+              << ", \"completion_limit\": " << stats.completion_limit
+              << ", \"completion_queries\": " << stats.completion_queries
+              << ", \"completion_scanned\": " << stats.completion_scanned
+              << ", \"completion_evaluated\": " << stats.completion_evaluated
+              << ", \"completion_candidates\": " << stats.completion_candidates
+              << ", \"completion_improvements\": " << stats.completion_improvements
+              << ", \"completion_limited_tasks\": " << stats.completion_limited_tasks
+              << ", \"completion_index_entries\": " << stats.completion_index_entries;
+}
+
 static void print_equation_results(const SearchRun& run) {
     auto matches = run.equation_matches ? *run.equation_matches
         : collect_equation_matches(run.cfg, run.arena, run.cfg.results);
@@ -9061,6 +9438,7 @@ static void print_equation_results(const SearchRun& run) {
                   << "  \"value_prune\": \"" << value_prune_mode_name(run.cfg.value_prune) << "\",\n"
                   << "  \"equation_search\": \"" << equation_search_mode_name(run.cfg.equation_search) << "\",\n"
                   << "  \"equation_quality\": \"" << equation_quality_mode_name(run.cfg.equation_quality) << "\",\n"
+                  << "  \"completion_mode\": \"" << completion_mode_name(run.cfg.completion_mode) << "\",\n"
                   << "  \"explore_pairs\": " << run.cfg.explore_pairs << ",\n"
                   << "  \"results\": [\n";
         for (std::size_t i = 0; i < matches.size(); ++i) {
@@ -9084,8 +9462,9 @@ static void print_equation_results(const SearchRun& run) {
                   << ", \"kept\": " << run.stats.kept
                   << ", \"anchor_candidates\": " << run.stats.anchor_extension_candidates
                   << ", \"unary_candidates\": " << run.stats.unary_closure_candidates
-                  << ", \"inverse_candidates\": " << run.stats.inverse_candidates
-                  << ", \"genetic_generations\": "
+                  << ", \"inverse_candidates\": " << run.stats.inverse_candidates;
+        print_completion_json_fields(run.stats);
+        std::cout << ", \"genetic_generations\": "
                   << run.stats.genetic_generations << ", \"genetic_repairs\": "
                   << run.stats.genetic_repairs << ", \"genetic_repairs_kept\": "
                   << run.stats.genetic_repairs_kept << ", \"genetic_crossovers\": "
@@ -9154,6 +9533,7 @@ static void print_results(const SearchRun& run) {
                   << "  \"strategy\": \"" << search_strategy_name(run.stats) << "\",\n"
                   << "  \"value_prune\": \"" << value_prune_mode_name(run.cfg.value_prune) << "\",\n"
                   << "  \"explore_pairs\": " << run.cfg.explore_pairs << ",\n"
+                  << "  \"completion_mode\": \"" << completion_mode_name(run.cfg.completion_mode) << "\",\n"
                   << "  \"results\": [\n";
         for (std::size_t i = 0; i < matches.size(); ++i) {
             const auto& m = matches[i];
@@ -9173,8 +9553,9 @@ static void print_results(const SearchRun& run) {
                   << ", \"kept\": " << run.stats.kept
                   << ", \"anchor_candidates\": " << run.stats.anchor_extension_candidates
                   << ", \"unary_candidates\": " << run.stats.unary_closure_candidates
-                  << ", \"inverse_candidates\": " << run.stats.inverse_candidates
-                  << ", \"genetic_generations\": "
+                  << ", \"inverse_candidates\": " << run.stats.inverse_candidates;
+        print_completion_json_fields(run.stats);
+        std::cout << ", \"genetic_generations\": "
                   << run.stats.genetic_generations << ", \"genetic_repairs\": "
                   << run.stats.genetic_repairs << ", \"genetic_repairs_kept\": "
                   << run.stats.genetic_repairs_kept << ", \"genetic_crossovers\": "
@@ -9361,6 +9742,8 @@ static void print_help(const char* program) {
         << "  --max-cost N              最大总复杂度，默认 10\n"
         << "  --side-cost N             双向搜索单边生成成本，默认自动取约 max-cost/2\n"
         << "  --deep-rounds N           通用深层拼接轮数，默认 0；不能用于方程或完整逐层模式\n"
+        << "  --completion-mode MODE    额外补全策略 auto/full/off，默认 auto；full 保留广泛补全和公平逆预算\n"
+        << "  --completion-budget N     auto 补全工作量上限，0 自动；不改变主搜索预算或 --no-stop\n"
         << "  --deep-beam N             每轮每成本新增候选上限，0=自动，默认 0\n"
         << "  --deep-frontier N         每成本参与深层拼接的输入前沿，0=不限；portfolio 自动限制到最多 2048\n"
         << "  --beam N                  每个复杂度层保留的表达式数，默认 3000\n"
@@ -9877,6 +10260,15 @@ static Config parse_cli(int argc, char** argv) {
         } else if (option_matches(arg, "--inverse-budget")) {
             cfg.inverse_budget = parse_u64(
                 option_value(i, argc, argv, arg, "--inverse-budget"), "--inverse-budget");
+        } else if (option_matches(arg, "--completion-mode")) {
+            const std::string mode = option_value(i, argc, argv, arg, "--completion-mode");
+            if (mode == "auto") cfg.completion_mode = CompletionMode::Auto;
+            else if (mode == "full") cfg.completion_mode = CompletionMode::Full;
+            else if (mode == "off") cfg.completion_mode = CompletionMode::Off;
+            else throw std::runtime_error("--completion-mode 必须是 auto、full 或 off");
+        } else if (option_matches(arg, "--completion-budget")) {
+            cfg.completion_budget = parse_u64(
+                option_value(i, argc, argv, arg, "--completion-budget"), "--completion-budget");
         } else if (option_matches(arg, "--max-abs")) {
             cfg.max_abs = parse_double(option_value(i, argc, argv, arg, "--max-abs"), "--max-abs");
         } else if (option_matches(arg, "--max-exponent")) {
@@ -10179,6 +10571,9 @@ static Config parse_cli(int argc, char** argv) {
         throw std::runtime_error("--deep-rounds 不能与 --no-bidirectional 同时使用");
     }
     if (cfg.results == 0) throw std::runtime_error("--results 必须大于 0");
+    if (cfg.completion_budget != 0 && cfg.completion_mode != CompletionMode::Auto) {
+        throw std::runtime_error("--completion-budget 只适用于 --completion-mode auto");
+    }
     if (live_top_explicit && cfg.live_top == 0) throw std::runtime_error("--live-top 必须大于 0");
     if (cfg.live_interval < 0.0) throw std::runtime_error("--live-interval 不能为负数");
     if (cfg.live && !live_top_explicit) cfg.live_top = cfg.results;
@@ -10202,6 +10597,37 @@ static int run_self_test() {
             ++failed;
         }
     };
+
+    {
+        std::uint64_t budget = 100;
+        {
+            SearchBudgetSlice first(budget, 40);
+            {
+                SearchBudgetSlice nested(first.remaining, 15);
+                nested.remaining -= 7;
+            }
+            check(first.remaining == 33, "递归预算只扣除实际消耗");
+            first.remaining -= 3;
+        }
+        check(budget == 90, "递归预算保留未使用额度供后续分支使用");
+        {
+            SearchBudgetSlice last(budget, 200);
+            check(last.remaining == 90, "子分支预算不超过父预算");
+            last.remaining = 0;
+        }
+        check(budget == 0, "递归预算不会超支");
+    }
+    {
+        Candidate candidate;
+        candidate.value = 0.5;
+        candidate.error = 0.125;
+        candidate.cost = 3;
+        candidate.constraint_state = 7;
+        const Node auxiliary = node_from_candidate(candidate, false);
+        check(auxiliary.error == candidate.error && !auxiliary.eligible &&
+                  auxiliary.constraint_state == candidate.constraint_state,
+              "临时补全节点保留舍入误差和约束状态");
+    }
 
     {
         bool equivalent = true;
@@ -10674,6 +11100,24 @@ static int run_self_test() {
         const Config equation_policy = parse_arguments(
             {"fates", "1", "--equations", "--equation-search", "wide",
              "--equation-quality", "local"});
+        const Config completion_auto = parse_arguments({"fates", "1", "--completion-budget", "17"});
+        const Config completion_full = parse_arguments({"fates", "1", "--completion-mode", "full"});
+        const Config completion_off = parse_arguments({"fates", "1", "--completion-mode", "off"});
+        check(completion_auto.completion_mode == CompletionMode::Auto && completion_auto.completion_budget == 17 &&
+                  completion_full.completion_mode == CompletionMode::Full &&
+                  completion_off.completion_mode == CompletionMode::Off,
+              "补全策略与工作预算解析");
+        bool completion_rejected = true;
+        for (const auto& tail : std::vector<std::vector<std::string>>{
+                 {"--completion-mode", "unknown"}, {"--completion-budget", "-1"},
+                 {"--completion-mode", "full", "--completion-budget", "1"},
+                 {"--completion-budget", "1", "--completion-mode", "off"}}) {
+            std::vector<std::string> arguments{"fates", "1"};
+            arguments.insert(arguments.end(), tail.begin(), tail.end());
+            try { (void)parse_arguments(arguments); completion_rejected = false; }
+            catch (const std::runtime_error&) {}
+        }
+        check(completion_rejected, "补全策略拒绝未知模式、负预算与无效组合");
         check(automatic.genetic && !deterministic_first.genetic && !deterministic_last.genetic &&
                    !deterministic_with_flag.genetic &&
                    exact_and_explore.value_prune == ValuePruneMode::Exact &&
@@ -11816,6 +12260,7 @@ static int run_self_test() {
         cfg.inverse_depth = 2;
         cfg.inverse_beam = 64;
         cfg.inverse_budget = 200'000;
+        cfg.completion_mode = CompletionMode::Full;
         cfg.show_stats = false;
         const SearchRun run = SearchEngine(cfg).run();
         const auto matches = collect_matches(run);
@@ -11824,6 +12269,61 @@ static int run_self_test() {
         });
         check(found && run.stats.used_inverse_templates && run.stats.inverse_candidates > 0,
               "Pareto 输出递归 inverse 独占成本层");
+        cfg.inverse_depth = 0;
+        const SearchRun without_inverse = SearchEngine(cfg).run();
+        check(run.stats.attempted >= without_inverse.stats.attempted &&
+                  run.stats.attempted - without_inverse.stats.attempted <= cfg.inverse_budget,
+              "逆模板分支公平调度仍遵守总预算");
+    }
+    {
+        Config cfg;
+        cfg.target = 0.731;
+        cfg.max_cost = 10;
+        cfg.beam = 96;
+        cfg.pair_budget = 2000;
+        cfg.ops = "+,-,*,/,sqrt,ln,sin,tan,asin";
+        cfg.pareto_slots = 2;
+        cfg.pareto_extra = 24;
+        cfg.deep_rounds = 2;
+        cfg.deep_beam = 32;
+        cfg.inverse_depth = 2;
+        cfg.inverse_budget = 2000;
+        cfg.stop_on_epsilon = false;
+        cfg.show_stats = false;
+        cfg.threads = 1;
+        const SearchRun serial = SearchEngine(cfg).run();
+        cfg.threads = 4;
+        const SearchRun parallel = SearchEngine(cfg).run();
+        const auto hashes = [](const SearchRun& run) {
+            std::vector<std::uint64_t> values;
+            for (const auto& node : run.arena) if (node.eligible) values.push_back(node.hash);
+            return values;
+        };
+        check(hashes(serial) == hashes(parallel) && serial.stats.attempted == parallel.stats.attempted &&
+                  serial.stats.valid == parallel.stats.valid && serial.stats.kept == parallel.stats.kept,
+              "附加候选一元补全和深搜裁剪跨线程确定性");
+        bool budgets_hold = true;
+        for (const std::uint64_t budget : {1ULL, 1000ULL, 10000ULL}) {
+            cfg.completion_budget = budget;
+            const SearchRun bounded = SearchEngine(cfg).run();
+            budgets_hold &= bounded.stats.completion_limit == budget &&
+                bounded.stats.completion_work <= budget &&
+                bounded.stats.completed_cost == cfg.max_cost && bounded.stats.used_deep_compositions;
+        }
+        check(budgets_hold, "补全工作额度包含索引且多轮耗尽不终止主搜索");
+        cfg.completion_budget = 0;
+        cfg.completion_mode = CompletionMode::Off;
+        const SearchRun off = SearchEngine(cfg).run();
+        check(off.stats.completion_work == 0 && off.stats.completion_candidates == 0 &&
+                  off.stats.completion_index_entries == 0 && off.stats.used_inverse_templates &&
+                  off.stats.used_deep_compositions && off.stats.completed_cost == cfg.max_cost,
+              "关闭额外补全不关闭逆搜索与深层主搜索");
+        cfg.completion_mode = CompletionMode::Auto;
+        cfg.target = 1.0;
+        const SearchRun cheap_hit = SearchEngine(cfg).run();
+        check(cheap_hit.stats.completion_work == 0 && cheap_hit.stats.completion_index_entries == 0 &&
+                  cheap_hit.stats.used_deep_compositions && cheap_hit.stats.completed_cost == cfg.max_cost,
+              "可靠低成本命中跳过补全索引但保留 no-stop 主搜索");
     }
     {
         // Above the side cost the partition sweep only produces binary roots.

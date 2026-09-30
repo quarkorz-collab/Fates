@@ -8,6 +8,8 @@ Example:
 
 Uses the standard benchmark workloads, plus the frontend's full deep preset.
 Unlike timing alone, a changed search result or counter makes this check fail.
+Use --allow-search-changes only for intentional coverage changes: each binary
+must still be deterministic across repeats, and quality is reported alongside time.
 """
 
 from __future__ import annotations
@@ -29,6 +31,14 @@ WORKLOADS["web-deep"] = [
     "--value-bits", "48", "--pareto-slots", "2", "--inverse-depth", "2",
     "--inverse-beam", "96", "--inverse-budget", "3000000", "--deep-rounds", "1",
     "--value-prune", "exact", "--explore-pairs", "4", "--no-stop",
+]
+WORKLOADS["sin-cos-completion"] = [
+    "1.49700762325366447336826357056303398521376068430762187966875392253715",
+    "--max-integer", "5", "--ops", "+,-,*,/,^,neg,inv,sqrt,ln,exp,sin,tan,atan,asin",
+    "--max-cost", "20", "--beam", "20000", "--pairs", "50000000", "--value-bits", "48",
+    "--value-prune", "exact", "--explore-pairs", "4", "--no-stop", "--pareto-slots", "2",
+    "--inverse-depth", "2", "--inverse-beam", "96", "--inverse-budget", "3000000",
+    "--deep-rounds", "1",
 ]
 WORKLOADS["constants-deep-live"] = [
     "777777", "--error-range", "(0,inf)", "--digits=", "--constants", "pi,e,phi,gamma",
@@ -129,6 +139,8 @@ def run(binary: Path, args: list[str], timeout: float, log_path: Path | None) ->
 def summarize(samples: list[dict]) -> dict:
     stages = samples[0]["payload"]["stats"]["stage_seconds"]
     return {
+        "best_absolute_error": min((result.get("absolute_error", float("inf"))
+                                    for result in samples[0]["payload"]["results"]), default=float("inf")),
         "median_wall_seconds": statistics.median(s["wall_seconds"] for s in samples),
         "min_wall_seconds": min(s["wall_seconds"] for s in samples),
         "median_stage_seconds": {
@@ -149,6 +161,8 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--allow-search-changes", action="store_true",
+                        help="allow intentional A/B coverage changes; still require repeat determinism")
     args = parser.parse_args()
     if args.repeats < 1 or args.threads < 1 or args.timeout <= 0:
         parser.error("repeats, threads and timeout must be positive")
@@ -176,8 +190,8 @@ def main() -> int:
         command_args = [*WORKLOADS[name], "--threads", str(args.threads), "--results", "20"]
         entry = {"args": command_args, "samples": {key: [] for key in binaries}}
         report["workloads"][name] = entry
-        expected = None
-        expected_live = None
+        expected = {}
+        expected_live = {}
         for repeat in range(args.repeats):
             order = list(binaries)
             offset = repeat % len(order)
@@ -195,15 +209,15 @@ def main() -> int:
                     print(f"FAIL: {error}", flush=True)
                     return 1
                 entry["samples"][label].append(sample)
-                if expected is None:
-                    expected = sample["fingerprint"]
-                    expected_live = sample.get("live", {}).get("fingerprint")
-                if sample["fingerprint"] != expected:
+                expectation_key = label if args.allow_search_changes else "all"
+                expected.setdefault(expectation_key, sample["fingerprint"])
+                expected_live.setdefault(expectation_key, sample.get("live", {}).get("fingerprint"))
+                if sample["fingerprint"] != expected[expectation_key]:
                     entry["error"] = f"results or counters changed: {label} run {repeat + 1}"
                     save()
                     print(f"FAIL: {entry['error']}", flush=True)
                     return 1
-                if sample.get("live", {}).get("fingerprint") != expected_live:
+                if sample.get("live", {}).get("fingerprint") != expected_live[expectation_key]:
                     entry["error"] = f"final live results changed: {label} run {repeat + 1}"
                     save()
                     print(f"FAIL: {entry['error']}", flush=True)
@@ -213,11 +227,15 @@ def main() -> int:
                 stage_text = ", ".join(f"{key}={value:.3f}s" for key, value in stages.items() if value)
                 print(f"  {sample['wall_seconds']:.3f}s; {stage_text}", flush=True)
         entry["summary"] = {label: summarize(samples) for label, samples in entry["samples"].items()}
-        entry["equivalent"] = True
+        entry["equivalent"] = len({sample["fingerprint"] for samples in entry["samples"].values()
+                                   for sample in samples}) == 1
         if "old" in entry["summary"]:
             entry["speedup"] = (entry["summary"]["old"]["median_wall_seconds"] /
                                 entry["summary"]["new"]["median_wall_seconds"])
-            print(f"  median speedup: {entry['speedup']:.3f}x; results/counters identical", flush=True)
+            status = "results/counters identical" if entry["equivalent"] else "intentional search change"
+            print(f"  median speedup: {entry['speedup']:.3f}x; {status}", flush=True)
+            print("  best errors: " + ", ".join(f"{label}={summary['best_absolute_error']:.3g}"
+                                               for label, summary in entry["summary"].items()), flush=True)
         save()
     return 0
 

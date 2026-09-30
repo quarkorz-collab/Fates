@@ -98,6 +98,40 @@ python tests/bench_search.py --bin build/fates --only recall \
   --reference-cache artifacts/recall-reference.json
 ```
 
+For an intentional search-space change, compare stage medians and solution
+quality while still checking each binary's repeat determinism:
+
+```bash
+python tests/bench_search_stages.py --bin build/fates --compare <baseline binary> \
+  --allow-search-changes --workload sin-cos-completion --workload web-deep --repeats 3
+python tests/check_unary_completion.py --bin build/fates --threads 1 4 16
+python tests/check_completion_policy.py --bin build/fates
+node tests/test_web_completion.cjs
+```
+
+Without `--allow-search-changes`, the stage harness still rejects any A/B
+result or counter change. The unary-completion regression uses the full
+reported operator set and budgets; it must find a near-exact result without
+enabling `cos`, and results/counters must match across thread counts.
+
+`check_completion_policy.py` covers auto/full/off at 1/4/16 threads, tiny and
+automatic budgets, multiple deep rounds, sparse layers, custom operation
+costs, symbol counts/order, and `--no-stop` after cheap hits or budget exhaustion.
+For policy comparisons with offline 80-digit checking and Windows peak memory:
+
+```bash
+python tests/probe_completion_policy.py --bin build/fates --compare <baseline binary> \
+  --manifest <frozen quality manifest> --modes auto full --repeats 3 --out <report.json>
+```
+
+Use identically optimized executables and interleaved repeated samples for
+performance claims. Compare both the original pre-fix reference and full
+enhancement, not merely the new off mode. Full is the compatibility policy;
+auto intentionally changes extra candidate selection. When checking old/new
+full output equivalence, strip only the newly added completion metadata and
+diagnostic counters (in addition to timings and thread count), not old counters
+or expression fields. Freeze any held-out targets before running them.
+
 `bench_search.py --compare` alternates the two binaries and reports the fastest
 run of each, which is what makes the numbers usable on a machine with
 background load. The `recall` mode measures the bounded search against the same

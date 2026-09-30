@@ -244,6 +244,10 @@ function validateConfiguration(args) {
   const maxCost = Number(element("maxCost").value);
   const sideCost = Number(element("sideCost").value || 0);
 
+  if (element("completionMode").value !== "auto" && Number(element("completionBudget").value || 0) !== 0) {
+    return { valid: false, message: "非零 completion-budget 仅适用于 auto 补全模式。" };
+  }
+
   if (equations && (genetic || portfolio || pslq || egraph || mcts)) {
     return { valid: false, message: "方程模式不能启用遗传、PSLQ、e-graph、MCTS 或 portfolio。" };
   }

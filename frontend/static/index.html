@@ -272,7 +272,7 @@
           </div>
         </details>
 
-        <details class="option-group" data-search-text="pareto inverse deep neighbors depth max abs exponent trig advanced 逆向 深层 指数 三角 前沿">
+        <details class="option-group" data-search-text="pareto inverse deep completion budget neighbors depth max abs exponent trig advanced 逆向 深层 补全 预算 指数 三角 前沿">
           <summary>
             <span><b>04</b> 逆向与深层扩展</span>
             <small>Advanced recall</small>
@@ -319,6 +319,20 @@
               <label class="field">
                 <span>中间值上限 <code>--max-abs</code></span>
                 <input id="maxAbs" type="text" value="1e100" data-option="--max-abs" data-default="1e100">
+              </label>
+              <label class="field">
+                <span>额外补全 <code>--completion-mode</code></span>
+                <select id="completionMode" data-option="--completion-mode" data-default="auto">
+                  <option value="auto" selected>auto · 平衡质量与开销</option>
+                  <option value="full">full · 完整增强</option>
+                  <option value="off">off · 关闭额外补全</option>
+                </select>
+                <small>auto 限额补全；full 保留广泛补全与根逆预算公平分配。均不隐式启用算子。</small>
+              </label>
+              <label class="field">
+                <span>补全工作预算 <code>--completion-budget</code></span>
+                <input id="completionBudget" type="number" min="0" step="1" value="0" data-option="--completion-budget" data-default="0">
+                <small>仅 auto 可设非零值；0 自动分配。耗尽只停止额外补全，不停止主搜索。</small>
               </label>
               <label class="field">
                 <span>指数上限 <code>--max-exponent</code></span>
