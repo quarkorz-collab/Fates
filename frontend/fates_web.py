@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import errno
 import hashlib
 import json
 import mimetypes
@@ -571,10 +572,13 @@ def handler_factory(manager: JobManager, root: Path, metadata: dict[str, object]
 
 class FatesHttpServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Windows SO_REUSEADDR lets a second process bind a port that is already listening.
+    allow_reuse_address = os.name != "nt"
     request_queue_size = 32
 
     def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         # HTTPServer reverse-resolves server_name; loopback URLs need no DNS.
         socketserver.TCPServer.server_bind(self)
         self.server_name, self.server_port = self.server_address[:2]
@@ -584,9 +588,35 @@ class FatesIPv6HttpServer(FatesHttpServer):
     address_family = socket.AF_INET6
 
 
+PORT_SEARCH_LIMIT = 20
+UNAVAILABLE_PORT_ERRORS = {
+    code
+    for code in (
+        errno.EADDRINUSE,
+        errno.EACCES,
+        getattr(errno, "WSAEADDRINUSE", None),
+        getattr(errno, "WSAEACCES", None),
+    )
+    if code is not None
+}
+
+
+def port_unavailable(error: OSError) -> bool:
+    return error.errno in UNAVAILABLE_PORT_ERRORS or getattr(error, "winerror", None) in UNAVAILABLE_PORT_ERRORS
+
+
 def create_http_server(host: str, port: int, handler: type[BaseHTTPRequestHandler]) -> FatesHttpServer:
     server_type = FatesIPv6HttpServer if host == "::1" else FatesHttpServer
-    return server_type((host, port), handler)
+    if port == 0:
+        return server_type((host, 0), handler)
+    # A busy or reserved port moves to the next ones, then to an OS-assigned port.
+    for candidate in range(port, min(port + PORT_SEARCH_LIMIT, 65536)):
+        try:
+            return server_type((host, candidate), handler)
+        except OSError as error:
+            if not port_unavailable(error):
+                raise
+    return server_type((host, 0), handler)
 
 
 def print_server_banner(url: str, fates_version: str, executable: Path) -> None:

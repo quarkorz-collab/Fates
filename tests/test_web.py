@@ -107,6 +107,36 @@ class RuntimeEnvironmentTests(unittest.TestCase):
         finally:
             server.server_close()
 
+    def test_occupied_port_moves_to_a_free_one(self):
+        with web.socket.socket(web.socket.AF_INET, web.socket.SOCK_STREAM) as occupant:
+            occupant.bind(("127.0.0.1", 0))
+            occupant.listen(1)
+            busy = occupant.getsockname()[1]
+            server = web.create_http_server("127.0.0.1", busy, web.BaseHTTPRequestHandler)
+            try:
+                self.assertNotEqual(server.server_port, busy)
+                self.assertNotEqual(server.server_port, 0)
+            finally:
+                server.server_close()
+
+    def test_exhausted_port_range_falls_back_to_os_assigned_port(self):
+        real_server = web.FatesHttpServer
+        requested = []
+
+        def busy_unless_zero(address, handler):
+            requested.append(address[1])
+            if address[1] != 0:
+                raise OSError(web.errno.EADDRINUSE, "in use")
+            return real_server(address, handler)
+
+        with patch.object(web, "FatesHttpServer", side_effect=busy_unless_zero):
+            server = web.create_http_server("127.0.0.1", 50000, web.BaseHTTPRequestHandler)
+        try:
+            self.assertEqual(requested, [*range(50000, 50000 + web.PORT_SEARCH_LIMIT), 0])
+            self.assertNotEqual(server.server_port, 0)
+        finally:
+            server.server_close()
+
     def test_linux_frozen_restores_original_library_path(self):
         for original in (None, "", "/opt/user-libraries"):
             environment = {"LD_LIBRARY_PATH": "/tmp/_MEI/private", "UNCHANGED": "yes"}

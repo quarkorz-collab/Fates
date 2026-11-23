@@ -3,33 +3,29 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark light">
-  <title>Fates · Expression Search Studio</title>
+  <meta name="color-scheme" content="light dark">
+  <title>Fates · 表达式搜索</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/styles.css">
+  <script src="/theme.js"></script>
 </head>
 <body>
-  <div class="ambient ambient-one"></div>
-  <div class="ambient ambient-two"></div>
-
   <header class="app-header">
-    <div class="brand-lockup">
-      <div class="brand-mark" aria-hidden="true">F</div>
-      <div>
-        <div class="brand-line">
-          <h1>Fates</h1>
-          <span class="edition">LOCAL STUDIO</span>
-        </div>
-        <p>Finding Algebraic Targets via Expression Search</p>
-      </div>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">ƒ</span>
+      <h1>Fates</h1>
+      <span class="brand-sub">Finding Algebraic Targets via Expression Search</span>
     </div>
-    <div class="header-status">
-      <span class="status-dot" id="serverDot"></span>
-      <div>
-        <span id="serverLabel">正在连接本地服务器</span>
-        <small id="versionLabel">127.0.0.1</small>
+    <div class="header-tools">
+      <div class="header-status">
+        <span class="status-dot" id="serverDot"></span>
+        <div>
+          <span id="serverLabel">正在连接本地服务器</span>
+          <small id="versionLabel">127.0.0.1</small>
+        </div>
       </div>
+      <button class="icon-button" id="themeButton" type="button" title="主题：跟随系统" aria-label="主题：跟随系统">◐</button>
     </div>
   </header>
 
@@ -41,10 +37,7 @@
   <main class="workspace" data-mobile-view="config">
     <aside class="control-panel">
       <div class="panel-heading">
-        <div>
-          <span class="eyebrow">SEARCH CONFIGURATION</span>
-          <h2>搜索配置</h2>
-        </div>
+        <h2>搜索配置</h2>
         <button class="icon-button" id="resetButton" type="button" title="恢复默认值">↺</button>
       </div>
 
@@ -66,10 +59,7 @@
 
       <form id="configForm" novalidate>
         <details class="option-group" open data-search-text="target mode result deduplicate bits error epsilon args file utility target 目标 模式 结果 去重 精度 误差 参数文件 控制">
-          <summary>
-            <span><b>01</b> 目标与结果</span>
-            <small>Target &amp; output</small>
-          </summary>
+          <summary><span class="section-no">§1</span><span class="section-title">目标与结果</span></summary>
           <div class="group-body">
             <label class="field field-wide emphasis">
               <span>目标值 TARGET <i>必填</i></span>
@@ -122,10 +112,7 @@
         </details>
 
         <details class="option-group" open data-search-text="digits constants operator literal integer cost custom symbol count group total order atoms 数字 常数 运算符 次数 合计 总数 分组 顺序 原子">
-          <summary>
-            <span><b>02</b> 原子、运算与约束</span>
-            <small>Atoms &amp; grammar</small>
-          </summary>
+          <summary><span class="section-no">§2</span><span class="section-title">原子、运算与约束</span></summary>
           <div class="group-body">
             <div class="field-grid">
               <label class="field">
@@ -200,10 +187,7 @@
         </details>
 
         <details class="option-group" open data-search-text="cost beam pairs threads chunks bits value prune exact bucket explore sampling atoms bidirectional stop performance search budget 成本 候选 预算 线程 性能 双向 数值剪枝 探索采样">
-          <summary>
-            <span><b>03</b> 搜索规模与性能</span>
-            <small>Core budgets</small>
-          </summary>
+          <summary><span class="section-no">§3</span><span class="section-title">搜索规模与性能</span></summary>
           <div class="group-body">
             <div class="field-grid three-columns">
               <label class="field">
@@ -273,10 +257,7 @@
         </details>
 
         <details class="option-group" data-search-text="pareto inverse deep completion budget neighbors depth max abs exponent trig advanced 逆向 深层 补全 预算 指数 三角 前沿">
-          <summary>
-            <span><b>04</b> 逆向与深层扩展</span>
-            <small>Advanced recall</small>
-          </summary>
+          <summary><span class="section-no">§4</span><span class="section-title">逆向与深层扩展</span></summary>
           <div class="group-body">
             <div class="field-grid three-columns">
               <label class="field">
@@ -347,10 +328,7 @@
         </details>
 
         <details class="option-group" data-search-text="equation genetic hybrid population generation seed elegance repair stable wide exhaustive strict local 方程 遗传 稳定 宽搜 穷举 严格">
-          <summary>
-            <span><b>05</b> 方程与遗传模式</span>
-            <small>Alternative modes</small>
-          </summary>
+          <summary><span class="section-no">§5</span><span class="section-title">方程与遗传模式</span></summary>
           <div class="group-body">
             <div class="toggle-grid">
               <label class="toggle">
@@ -441,10 +419,7 @@
         </details>
 
         <details class="option-group" data-search-text="pslq integer relation egraph equality saturation mcts monte carlo tree elegance advanced portfolio 整数关系 等式饱和 蒙特卡洛 优雅 高级 组合">
-          <summary>
-            <span><b>06</b> 高级搜索算法</span>
-            <small>Optional search stages</small>
-          </summary>
+          <summary><span class="section-no">§6</span><span class="section-title">高级搜索算法</span></summary>
           <div class="group-body">
             <div class="field-grid three-columns">
               <label class="field">
@@ -541,10 +516,7 @@
         </details>
 
         <details class="option-group" data-search-text="live json dry run verbose stats output real time 实时 输出 JSON 统计">
-          <summary>
-            <span><b>07</b> 实时与诊断输出</span>
-            <small>Live &amp; diagnostics</small>
-          </summary>
+          <summary><span class="section-no">§7</span><span class="section-title">实时与诊断输出</span></summary>
           <div class="group-body">
             <div class="toggle-grid">
               <label class="toggle">
@@ -604,31 +576,18 @@
     </aside>
 
     <section class="result-panel">
-      <div class="hero-card">
-        <div class="hero-copy">
-          <span class="eyebrow">EXPRESSION SEARCH</span>
-          <h2>让数值找到优雅的表达式。</h2>
-          <p>双向搜索、逆模板、等式饱和、整数关系、MCTS 与遗传探索，共享同一套成本和合法性规则。</p>
-        </div>
-        <div class="hero-orbit" aria-hidden="true">
-          <span>π</span><span>e</span><span>√</span><span>φ</span>
-          <b>≈</b>
-        </div>
-      </div>
+
 
       <div class="command-card">
         <div class="command-title">
-          <div>
-            <span class="eyebrow">EDITABLE COMMAND</span>
-            <h3>命令行配置</h3>
-          </div>
+          <h3>命令</h3>
           <div class="command-actions">
             <button id="importCommand" type="button" class="quiet-button accent-button">导入到表单</button>
             <button id="copyCommand" type="button" class="quiet-button">复制命令</button>
           </div>
         </div>
         <textarea id="commandPreview" rows="3" spellcheck="false" aria-label="可编辑的 Fates 命令">fates 520.82418 --json</textarea>
-        <div class="command-hint">可粘贴或直接修改 <span id="commandShellLabel">本机 shell</span> 风格命令，再点“导入到表单”。支持引号、续行、<code>--name=value</code>、重复常数和符号次数；不执行 shell 展开。</div>
+        <div class="command-hint">可直接编辑 <span id="commandShellLabel">本机 shell</span> 命令，Ctrl+Enter 或“导入到表单”同步回左侧；支持引号、续行与 <code>--name=value</code>，不做 shell 展开。</div>
         <div class="validation-message" id="validationMessage" aria-live="polite"></div>
         <div class="action-row">
           <button id="runButton" type="button" class="primary-button">
@@ -661,8 +620,7 @@
 
         <div class="tab-pane active" id="resultsPane" data-pane="results">
           <div class="empty-state" id="emptyState">
-            <div class="empty-symbol">ƒ</div>
-            <h3>准备探索表达式空间</h3>
+            <div class="empty-formula" aria-hidden="true">f(π, e, φ, …) ≈ <i>t</i></div>
             <p>选择预设或调整左侧参数，然后开始搜索。</p>
           </div>
           <div class="table-wrap hidden" id="resultTableWrap">
@@ -676,7 +634,7 @@
 
         <div class="tab-pane" id="livePane" data-pane="live-output">
           <div class="live-heading">
-            <div><span class="eyebrow">LIVE FRONTIER</span><b id="liveTitle">等待实时结果</b></div>
+            <b id="liveTitle">等待实时结果</b>
             <small id="liveMeta">启用 --live 或 --live-top 后显示当前 top N</small>
           </div>
           <div class="live-empty" id="liveEmpty">搜索开始后，当前最优候选会在这里平滑更新。</div>
@@ -698,11 +656,6 @@
       </div>
     </section>
   </main>
-
-  <footer>
-    <span>Fates Local Studio</span>
-    <span>仅监听本机回环地址 · 命令不经过 shell · 搜索由本地 Fates 引擎执行</span>
-  </footer>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 

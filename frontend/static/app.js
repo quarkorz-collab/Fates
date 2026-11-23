@@ -83,6 +83,26 @@ try {
 } catch {
 }
 
+const themeLabels = { system: "跟随系统", light: "纸面", dark: "黑板" };
+
+function cycleTheme() {
+  const order = ["system", "light", "dark"];
+  const current = document.documentElement.dataset.theme || "system";
+  const next = order[(order.indexOf(current) + 1) % order.length];
+  if (next === "system") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = next;
+  try {
+    if (next === "system") localStorage.removeItem("fates-theme");
+    else localStorage.setItem("fates-theme", next);
+  } catch {
+  }
+  const button = element("themeButton");
+  const label = `主题：${themeLabels[next]}`;
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  showToast(`主题已切换为${themeLabels[next]}。`);
+}
+
 const presets = {
   quick: {
     maxCost: "10", beam: "3000", pairs: "4000000", valueBits: "42",
@@ -1191,6 +1211,7 @@ async function initializeServerStatus() {
     element("serverDot").classList.add("online");
     element("serverLabel").textContent = "本地服务器已连接";
     element("versionLabel").textContent = metadata.fates_version;
+    element("versionLabel").title = metadata.fates_version;
   } catch (error) {
     element("serverDot").classList.add("offline");
     element("serverLabel").textContent = "本地服务器不可用";
@@ -1238,6 +1259,7 @@ element("resetButton").addEventListener("click", () => {
   clearPresetSelection();
   refreshCommand();
 });
+element("themeButton").addEventListener("click", cycleTheme);
 
 function setCatalogSelection(inputId, entries, predicate) {
   const existing = new Map(csvEntries(inputId).map((entry) => [entryName(entry), entry]));

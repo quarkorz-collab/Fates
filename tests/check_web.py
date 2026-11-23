@@ -194,7 +194,7 @@ def check(engine_source: Path, web_source: Path | None) -> None:
             constant_names = {item["name"] for item in metadata["symbols"]["constants"]}
             assert {"apery", "glaisher", "khinchin", "zeta2"} <= constant_names
 
-            for asset in ("index.html", "app.js", "styles.css", "favicon.svg", "vendor/katex/katex.min.js",
+            for asset in ("index.html", "app.js", "theme.js", "styles.css", "favicon.svg", "vendor/katex/katex.min.js",
                           "vendor/katex/katex.min.css", "vendor/katex/fonts/KaTeX_Main-Regular.woff2"):
                 status, headers, data = request(url, "/" if asset == "index.html" else "/" + asset)
                 assert status == 200, (asset, status)
